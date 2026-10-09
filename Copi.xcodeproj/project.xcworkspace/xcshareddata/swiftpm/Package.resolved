@@ -1,14 +1,6 @@
 {
+  "originHash" : "4cdf14d2bc6168aef04c8f475ca57646815a2d1b232f897a9f7475f2c5f8ec69",
   "pins" : [
-    {
-      "identity" : "appupdater",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/s1ntoneli/AppUpdater",
-      "state" : {
-        "revision" : "34f03b7cea97bbc1f4ee19dc9bcb9bb055038b71",
-        "version" : "0.1.1"
-      }
-    },
     {
       "identity" : "axswift",
       "kind" : "remoteSourceControl",
@@ -16,6 +8,15 @@
       "state" : {
         "revision" : "81dcc36aced905d6464cc25e35f8d13184bbf21c",
         "version" : "0.3.2"
+      }
+    },
+    {
+      "identity" : "axswiftext",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/s1ntoneli/AXSwiftExt",
+      "state" : {
+        "revision" : "a2696cad4504996dffc53bb59892e13242a2c243",
+        "version" : "0.1.0"
       }
     },
     {
@@ -28,6 +29,15 @@
       }
     },
     {
+      "identity" : "keyboardshortcuts",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/s1ntoneli/KeyboardShortcuts",
+      "state" : {
+        "revision" : "04cef0ec7489810fdacd2301378ca0f3a5bd163a",
+        "version" : "2.0.0"
+      }
+    },
+    {
       "identity" : "launchatlogin",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sindresorhus/LaunchAtLogin",
@@ -35,25 +45,7 @@
         "revision" : "22923d335429bfd38c52435505b06a10bcc520fd",
         "version" : "5.0.1"
       }
-    },
-    {
-      "identity" : "path.swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mxcl/Path.swift",
-      "state" : {
-        "revision" : "8e355c28e9393c42e58b18c54cace2c42c98a616",
-        "version" : "1.4.1"
-      }
-    },
-    {
-      "identity" : "version",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mxcl/Version.git",
-      "state" : {
-        "revision" : "1fe824b80d89201652e7eca7c9252269a1d85e25",
-        "version" : "2.0.1"
-      }
     }
   ],
-  "version" : 2
+  "version" : 3
 }

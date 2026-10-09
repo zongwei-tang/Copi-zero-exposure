@@ -23,6 +23,9 @@ class MouseEventCatcher {
     var dragMonitor: Any? = nil
     var scrollWheelMonitor: Any? = nil
     var keyboardMonitor: Any? = nil
+    var otherButtonsMonitor: Any? = nil
+    // 取消长按计时（PointerInterceptor 吞掉了这次左键松开，这里收不到）
+    private var consumePress: (() -> Void)?
     
     init() {
         // 拖拽判断
@@ -39,7 +42,16 @@ class MouseEventCatcher {
         var totalScrollDistance = 0.0
 
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp], handler: { [self] event in
-            print("onLeftMouseUp")
+            // 鼠标松开可能刚改了选区：复制网页内容时据此稍等浏览器同步
+            InputActivity.noteInput()
+            // 点了菜单或 App 里的"复制"按钮：App 写进系统剪贴板后尽快转移走（Copi 拦不住这类复制，只能缩短停留时间）
+            if GlobalMode.shared.isProtecting {
+                NSPasteboard.general.checkFrequently(for: 0.5)
+            }
+            // 拖放结束：清掉留在拖放剪贴板上的文字
+            DragPasteboardScrubber.shared.mouseUp()
+            // 事件里带着松开时指针下面的窗口（主线程处理时指针可能已经移开、菜单已经关了）
+            GlobalMode.shared.noteMouseUp(windowNumber: event.cgEvent.map { Int($0.getIntegerValueField(.mouseEventWindowUnderMousePointer)) })
             if !handled {
                 downTimer?.invalidate()
                 downTimer = nil
@@ -90,11 +102,29 @@ class MouseEventCatcher {
                 downTimer = nil
             }
         })
-        keyboardMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { event in
-            if let characters = event.characters?.first {
+        // 右键菜单（或其他按键）里选了"拷贝"：同样尽快把 App 写进系统剪贴板的内容转移走
+        otherButtonsMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.rightMouseUp, .otherMouseUp], handler: { event in
+            GlobalMode.shared.noteMouseUp(windowNumber: event.cgEvent.map { Int($0.getIntegerValueField(.mouseEventWindowUnderMousePointer)) })
+            if GlobalMode.shared.isProtecting {
+                NSPasteboard.general.checkFrequently(for: 0.5)
+            }
+        })
+        keyboardMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged], handler: { event in
+            // 打字、按下 ⌘（⌘Tab 切走、快捷键）：收起快捷操作栏
+            if event.type == .flagsChanged ? event.modifierFlags.contains(.command) : event.characters?.isEmpty == false {
                 self.notifyAllUnSelectHooks(event: event)
             }
         })
+        consumePress = {
+            downTimer?.invalidate()
+            downTimer = nil
+            handled = true
+        }
+    }
+
+    // 主线程：这次左键松开被吞掉了（菜单里的拷贝/剪切/粘贴由 Copi 处理），不要把它当成长按弹出快捷操作栏
+    func pressConsumed() {
+        consumePress?()
     }
     
     deinit {

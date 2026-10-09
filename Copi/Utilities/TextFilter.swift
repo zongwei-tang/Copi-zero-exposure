@@ -120,7 +120,6 @@ enum TextFilter: CaseIterable {
                 regex.replaceMatches(in: mutableString, range: match.range, withTemplate: replacement)
             }
 
-            print(mutableString)
             return mutableString as String
         } else {
             print("Invalid regular expression pattern.")

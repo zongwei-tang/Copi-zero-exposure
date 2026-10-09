@@ -7,7 +7,7 @@
 
 import Foundation
 import SwiftUI
-import AXSwift
+import ApplicationServices
 
 class PopupWindowController: NSWindowController, NSWindowDelegate {
     static let shared = PopupWindowController()
@@ -33,27 +33,39 @@ class PopupWindowController: NSWindowController, NSWindowDelegate {
         window?.backgroundColor = .clear
     }
     
-    func showWindowAt(_ mouseLocation: NSPoint, _ text: String) {
+    // pasteTarget：Action Bar 出现时拿着焦点的输入框（Paste 只粘贴进它）；nil 时不提供 Paste
+    func showWindowAt(_ mouseLocation: NSPoint, canCopy: Bool, pasteTarget: AXUIElement?) {
         guard let window = window else { return }
         window.makeKeyAndOrderFront(nil)
 
         let location = NSPoint(x: mouseLocation.x - window.frame.width / 2, y: mouseLocation.y + window.frame.height / 2)
         window.setFrameOrigin(location)
+        viewModel.canCopy = canCopy
+        viewModel.canPaste = pasteTarget != nil
+        viewModel.pasteTarget = pasteTarget
         showWindow(nil)
+        // 别的 App 到了前台（焦点不在原来的地方了）、过了 8 秒还没点：收起来
+        if activationObserver == nil {
+            activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                                                                                   object: nil, queue: .main) { _ in
+                PopupWindowController.shared.closeWindow()
+            }
+        }
+        autoClose?.cancel()
+        let work = DispatchWorkItem {
+            PopupWindowController.shared.closeWindow()
+        }
+        autoClose = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
     }
-    
-    func showWindowAt(_ mouseLocation: NSPoint, copyItem: UIElement?, pasteItem: UIElement?) {
-        guard let window = window else { return }
-        window.makeKeyAndOrderFront(nil)
 
-        let location = NSPoint(x: mouseLocation.x - window.frame.width / 2, y: mouseLocation.y + window.frame.height / 2)
-        window.setFrameOrigin(location)
-        viewModel.copyItem = copyItem
-        viewModel.pasteItem = pasteItem
-        showWindow(nil)
-    }
-    
+    private var activationObserver: Any?
+    private var autoClose: DispatchWorkItem?
+
     func closeWindow() {
+        autoClose?.cancel()
+        autoClose = nil
+        viewModel.pasteTarget = nil
         close()
         window?.close()
     }
@@ -68,22 +80,24 @@ class PopupWindow: NSPanel {
 }
 
 class PopupViewModel: ObservableObject {
-    @Published var copyItem: UIElement?
-    @Published var pasteItem: UIElement?
+    @Published var canCopy = false
+    @Published var canPaste = false
+    // Action Bar 出现时拿着焦点的输入框
+    var pasteTarget: AXUIElement?
 }
 
 struct PopupView: View {
     @EnvironmentObject var vm: PopupViewModel
     @State var hovered = false
     @State var selections: Set<Int> = []
-    
+
     var body: some View {
         HStack(spacing: 0) {
-            if let copyItem = vm.copyItem {
+            if vm.canCopy {
                 PopupItemView(title: "Copy", icon: "lock.shield")
                     .stag(0)
                     .onTapGesture {
-                        try? copyItem.performAction(.press)
+                        safeCopySelection()
                         PopupWindowController.shared.closeWindow()
                     }
                     .onHover { hover in
@@ -92,11 +106,12 @@ struct PopupView: View {
                         }
                     }
             }
-            if let text = NSPasteboard.safeCopy.string(), let pasteItem = vm.pasteItem {
+            if vm.canPaste {
                 PopupItemView(title: "Paste", icon: "lock.shield")
                     .onTapGesture {
+                        let target = vm.pasteTarget
                         PopupWindowController.shared.closeWindow()
-                        try? pasteItem.performAction(.press)
+                        safePaste(expecting: target)
                     }
                     .stag(1)
                     .onHover { hover in

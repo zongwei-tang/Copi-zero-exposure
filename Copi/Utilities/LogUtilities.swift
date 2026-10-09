@@ -25,7 +25,7 @@ func log(_ level: LogLevel = .verbose, _ tag: String = "", _ message: Any..., fi
 
     let fileName = URL(fileURLWithPath: file).lastPathComponent.split(separator: ".")[0]
 #if DEBUG
-    print("\(level.rawValue)\(timeStr): \(fileName)-\(function)", tag, message ?? "")
+    print("\(level.rawValue)\(timeStr): \(fileName)-\(function)", tag, message)
 #endif
 }
 

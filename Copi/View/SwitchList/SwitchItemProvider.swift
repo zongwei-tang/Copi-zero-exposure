@@ -16,7 +16,7 @@ class SwitchItemProvider {
         }
         
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: path.string))
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
             return try JSONDecoder().decode([SensitiveDataRegexModel].self, from: data)
         } catch {
             print(error)
@@ -42,7 +42,6 @@ extension SensitiveDataRegexModel {
     
     func filter(_ value: String, template: (String) -> String = { _ in "REPLACED" }) -> String {
         // 创建正则表达式对象
-        print("filtering by regex", regex)
         if let regex = try? NSRegularExpression(pattern: regex, options: []) {
             // 查找匹配的字符串
             let matches = regex.matches(
@@ -58,7 +57,6 @@ extension SensitiveDataRegexModel {
                 regex.replaceMatches(in: mutableString, range: match.range, withTemplate: replacement)
             }
 
-            print(mutableString)
             return mutableString as String
         } else {
             print("Invalid regular expression pattern.")
