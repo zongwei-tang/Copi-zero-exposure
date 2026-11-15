@@ -14,12 +14,15 @@ let fixtures = baseDir.appendingPathComponent("fixtures")
 let reportURL = baseDir.appendingPathComponent("report.md")
 let logURL = baseDir.appendingPathComponent("run.log")
 let startTime = Date()
-// 只跑指定的几组（run.sh --only=basic,browsers,browsermore,terminal,sudo,guard,watchdog,iterm,vm,slack,vscode,concealed,lock）
+// 只跑指定的几组（run.sh --only=basic,browsers,browsermore,terminal,sudo,guard,watchdog,iterm,vm,slack,vscode,matrix,concealed,lock）
 let onlyGroups: Set<String>? = CommandLine.arguments.first { $0.hasPrefix("--only=") }
     .map { Set($0.dropFirst("--only=".count).split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }) }
 func wants(_ group: String) -> Bool {
     onlyGroups?.contains(group) ?? true
 }
+// 矩阵里只跑指定的几项（--cases=K.11,K.11m）：查一项时不用整组重跑
+let onlyCases: Set<String>? = CommandLine.arguments.first { $0.hasPrefix("--cases=") }
+    .map { Set($0.dropFirst("--cases=".count).split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }) }
 
 // 在 GitHub Actions 的虚拟机上跑（一次性的机器，没有个人信息）
 let onCI = ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true"
@@ -29,7 +32,8 @@ let runID = String(format: "%04x", arc4random_uniform(0x10000))
 
 var logLines: [String] = []
 func log(_ message: String) {
-    logLines.append(String(format: "%7.2f ", Date().timeIntervalSince(startTime)) + message)
+    logLines.append(String(format: "%7.2f ", Date().timeIntervalSince(startTime))
+                    + message.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))
     try? logLines.joined(separator: "\n").write(to: logURL, atomically: true, encoding: .utf8)
 }
 
@@ -42,6 +46,8 @@ struct TestResult {
 var results: [TestResult] = []
 
 func record(_ id: String, _ name: String, _ status: String, _ note: String) {
+    // 你的电脑上：路径里的用户目录写成 ~（报告里不留用户名）
+    let note = note.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
     results.append(TestResult(id: id, name: name, status: status, note: note))
     log("RESULT \(id) \(status) \(name) | \(note)")
     writeReport()
@@ -268,7 +274,18 @@ func run(_ path: String, _ arguments: [String], timeout: TimeInterval = 20) -> (
         sleepMS(20)
     }
     if process.isRunning {
+        // 超时：结束它。terminate 之后进程不会马上退出，这时读 terminationStatus 会抛异常、让测试程序整个崩掉：等它退出再读。
+        // 还不退出就 SIGKILL；输出不读（它启动的子进程可能还拿着管道，读到底会一直等）
         process.terminate()
+        let killDeadline = Date().addingTimeInterval(2)
+        while process.isRunning, Date() < killDeadline {
+            sleepMS(20)
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+            sleepMS(200)
+        }
+        return (process.isRunning ? -2 : process.terminationStatus, "timed out")
     }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     return (process.terminationStatus, String(decoding: data, as: UTF8.self))
@@ -324,17 +341,63 @@ let knownAppIDs: Set<String> = ["com.apple.TextEdit", "com.brave.Browser", "com.
                                 "com.apple.Spotlight", "com.apple.dock", "com.apple.systemuiserver", "com.apple.controlcenter",
                                 "com.raycast.macos", "com.runningwithcrayons.Alfred", "com.google.Chrome"]
 
+// GitHub Actions 的虚拟机上弹出的系统对话框（权限询问之类，由 UserNotificationCenter 显示）：写出上面的文字和按钮，
+// 好知道是什么弹出来的。只在虚拟机上读（你的电脑上不读别的程序的窗口）
+func systemAlertText() -> String? {
+    guard onCI, let focused = focusedApp(), focused.bundleID == "com.apple.UserNotificationCenter" else {
+        return nil
+    }
+    var texts: [String] = []
+    func walk(_ element: AXUIElement, depth: Int) {
+        guard depth < 8, texts.count < 20 else {
+            return
+        }
+        let role = axString(element, kAXRoleAttribute) ?? ""
+        if role == kAXStaticTextRole, let value = axString(element, kAXValueAttribute), !value.isEmpty {
+            texts.append(value)
+        } else if role == kAXButtonRole, let title = axString(element, kAXTitleAttribute), !title.isEmpty {
+            texts.append("[\(title)]")
+        }
+        axChildren(element).forEach { walk($0, depth: depth + 1) }
+    }
+    windows(focused.pid).forEach { walk($0, depth: 0) }
+    return texts.isEmpty ? "（读不到文字）" : texts.joined(separator: " ").replacingOccurrences(of: "\n", with: " ")
+}
+
+// 系统对话框已经写进报告的（同一段文字只写一次）
+var reportedSystemAlerts: Set<String> = []
+
 // 发按键之前必须通过：焦点 App 是目标 App，焦点窗口就是测试窗口。否则先试着带到前台，还不行就中止整轮测试
 func gate(_ target: TestWindow) throws {
-    for attempt in 0..<3 {
+    func passes() -> Bool {
         if let focused = focusedApp(), focused.pid == target.pid,
            let window = axElement(ax(AXUIElementCreateApplication(target.pid), kAXFocusedWindowAttribute)),
            CFEqual(window, target.window),
            target.titleCheck?(axString(target.window, kAXTitleAttribute) ?? "") ?? true,
            target.contentCheck?() ?? true {
-            return
+            return true
         }
-        if attempt < 2 {
+        return false
+    }
+    for round in 0..<2 {
+        for attempt in 0..<3 {
+            if passes() {
+                return
+            }
+            if attempt < 2 {
+                bringToFront(target)
+            }
+        }
+        // 虚拟机上系统对话框挡在前面：写进报告，等它自己消失（最多 30 秒）再试一轮。不按它的按钮（不替用户回答权限询问）
+        guard round == 0, let alert = systemAlertText() else {
+            break
+        }
+        if reportedSystemAlerts.insert(alert).inserted {
+            record("alert", "系统对话框挡在前面", "INFO", alert)
+        }
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline, focusedApp()?.bundleID == "com.apple.UserNotificationCenter" {
+            sleepMS(1000)
             bringToFront(target)
         }
     }
@@ -347,6 +410,9 @@ func gate(_ target: TestWindow) throws {
        let window = axElement(ax(AXUIElementCreateApplication(target.pid), kAXFocusedWindowAttribute)) {
         detail = CFEqual(window, target.window) ? "；测试窗口当前显示的不是测试内容（别的标签页或文件）"
             : "；焦点在同一个 App 的另一个窗口（\(axString(window, kAXSubroleAttribute) ?? "nil")）"
+    }
+    if let alert = systemAlertText() {
+        detail += "；系统对话框：\(alert)"
     }
     throw Abort(reason: "焦点不在测试窗口（期望 \(target.bundleID)，实际 \(shown)\(detail)），为安全起见停止")
 }
@@ -432,10 +498,16 @@ func pageHTML(mode: String) -> String {
     let para = paraTexts.map { "<p>\($0)</p>" }.joined()
     let long = longLines.map { "<p>\($0)</p>" }.joined()
     let icon = "<img alt=\"\" width=\"16\" height=\"16\" src=\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><circle cx='8' cy='8' r='7' fill='red'/></svg>\"><button>Icon</button>"
+    // kind-<class>：页面最前面一个带这个 class 的可编辑区（代码编辑器、网页终端、Google Docs、Sheets 的识别靠 class），选中它的文字。
+    // 放在表单控件前面：Chromium 里起点紧挨表单控件的脚本选区读不出来（已知限制），不能让它混进这里的结果
+    let kindClass = mode.hasPrefix("kind-") ? String(mode.dropFirst("kind-".count)) : nil
+    let kindHTML = kindClass.map { "<div class=\"\($0)\" id=\"kd\" contenteditable=\"true\" style=\"border:1px solid #888;margin-bottom:12px\">Copi blocked \($0) text</div>" } ?? ""
+    let linkHTML = mode == "link" ? "<p style=\"font-size:22px\"><a id=\"lnk\" href=\"https://example.com/copi-link\">Copi test link</a></p>" : ""
     return """
     <!doctype html><html><head><meta charset="utf-8"><title>COPI|loading|\(mode)</title>
     <style>body{font:15px -apple-system;margin:20px} #long p{margin:0} textarea,input{display:block;margin:8px 0;width:420px}</style></head>
     <body>
+    \(kindHTML)\(linkHTML)
     <textarea id="ta" rows="3"></textarea><input id="in"><input id="pw" type="password" autocomplete="new-password">
     <button id="cb" onclick="copyTest()">Copy test</button>
     <div class="cm-editor"><div class="cm-content" id="ce" contenteditable="true" style="min-height:30px;border:1px solid #888"></div></div>
@@ -451,6 +523,10 @@ func pageHTML(mode: String) -> String {
     window.addEventListener('load',()=>{
       if(MODE.startsWith('sel-')){const el=document.getElementById(MODE.slice(4));const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r);}
       else if(MODE.startsWith('focus-')){const el=document.getElementById(MODE.slice(6));if('value' in el)el.value='';el.focus();}
+      else if(MODE==='pw-filled'){const el=document.getElementById('pw');el.value='CopiPw-filled-1';last.pw=el.value;el.focus();el.select();}
+      else if(MODE.startsWith('long-')){const el=document.getElementById('in');el.value='x'.repeat(parseInt(MODE.slice(5)));last.in=el.value;el.focus();el.select();}
+      else if(MODE==='lone-in'){const el=document.getElementById('in');el.value='ab'+String.fromCharCode(0xD800)+'cd';last.in=el.value;el.focus();el.setSelectionRange(0,0);}
+      else if(MODE.startsWith('kind-')){const el=document.getElementById('kd');el.focus();const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r);}
       document.title=`COPI|ready|${MODE}`;
     });
     </script></body></html>
@@ -461,7 +537,8 @@ func prepareFixtures() {
     try? FileManager.default.removeItem(at: fixtures)
     try? FileManager.default.createDirectory(at: fixtures, withIntermediateDirectories: true)
     try? FileManager.default.createDirectory(at: fixtures.appendingPathComponent("markers"), withIntermediateDirectories: true)
-    for mode in ["sel-para", "sel-long", "focus-ta", "focus-in", "focus-pw", "plain", "copybtn", "focus-ce", "cmd"] {
+    for mode in ["sel-para", "sel-long", "focus-ta", "focus-in", "focus-pw", "plain", "copybtn", "focus-ce", "cmd",
+                 "pw-filled", "long-10000", "long-9900", "long-8000", "lone-in", "link", "kind-plain-edit", "kind-cm-content", "kind-xterm", "kind-kix-appview-editor", "kind-cell-input"] {
         _ = writeFixture("page-\(mode).html", pageHTML(mode: mode))
     }
     // 独立的 zsh：不读用户自己的配置，不写用户的历史记录；提示符里带着这一轮的标记
@@ -535,6 +612,7 @@ func closeWindow(_ target: TestWindow) {
     }
     chord(keyW(), cmd)
     sleepMS(400)
+    dismissSaveSheet(target.window)
 }
 
 // 复制 TextEdit 里的一段文字（⌘A ⌘C），之后看系统剪贴板上有没有出现过文字
@@ -554,7 +632,11 @@ func openPage(_ browser: (String, String), mode: String) throws -> TestWindow {
     let url = fixtures.appendingPathComponent("page-\(mode).html")
     openWith(browser.1, url.path)
     guard var window = waitWindow(browser.0, browser.1, titleContains: "COPI|ready|\(mode)", timeout: 15) else {
-        throw Abort(reason: "\(browser.1) 没有打开测试页 \(mode)")
+        // 只记数量：浏览器有几个窗口、其中几个是测试页（停在加载中的、别的测试页的），别的窗口的标题不看
+        let titles = pids(browser.0).flatMap { windows($0) }.map { axString($0, kAXTitleAttribute) ?? "" }
+        let loading = titles.filter { $0.contains("COPI|loading|\(mode)") }.count
+        let otherTests = titles.filter { $0.contains("COPI|") && !$0.contains("|\(mode)") }.count
+        throw Abort(reason: "\(browser.1) 没有打开测试页 \(mode)（进程 \(pids(browser.0).count) 个、窗口 \(titles.count) 个，其中这个测试页停在加载中 \(loading) 个、别的测试页 \(otherTests) 个）")
     }
     // 窗口的标题就是当前标签页的标题：发按键前确认当前标签页还是测试页
     window.titleCheck = { $0.contains("COPI|") }
@@ -576,9 +658,10 @@ func waitTitle(_ target: TestWindow, prefix: String, timeout: TimeInterval = 4) 
 }
 
 // 网页输入框里的结果（标题 "COPI|ta|len=..|h=.."）
+// 等到期望的内容（框里原来就有内容、或者打字分几次到达时，第一次变化还不是最后的结果）
 func fieldResult(_ target: TestWindow, field: String, expected: String) -> (String, String) {
-    let title = waitTitle(target, prefix: "COPI|\(field)|") ?? "nil"
     let want = "len=\(expected.utf16.count)|h=\(djb2(expected))"
+    let title = waitTitle(target, prefix: "COPI|\(field)|\(want)") ?? "nil"
     if title.contains("COPI|\(field)|"), title.contains(want) {
         return ("PASS", "内容一致（\(expected.utf16.count) 字符）")
     }
@@ -613,6 +696,77 @@ func webSelectionDiag(_ target: TestWindow) -> String {
         }
     }
     return "焦点角色=\(role(focused) ?? "nil") 网页节点=\(list.contains("ChromeAXNodeId") || list.contains("AXDOMIdentifier")) 选区长度=\(length)"
+}
+
+// Chromium 里读不出网页选区时，照 Copi 的办法（ZeroExposure.swift 的 paragraphPreservingString）一段段走一遍，记下每一步：
+// 只记长度、索引、出错代码；调试描述里只有测试页自己的文字
+func chromiumSelectionTrace(_ target: TestWindow) -> String {
+    let app = AXUIElementCreateApplication(target.pid)
+    guard let focused = axElement(ax(app, kAXFocusedUIElementAttribute)) else {
+        return "焦点元素=nil"
+    }
+    guard let raw = ax(focused, "AXSelectedTextMarkerRange"), CFGetTypeID(raw) == AXTextMarkerRangeGetTypeID() else {
+        return "没有选区"
+    }
+    func param(_ attribute: String, _ parameter: CFTypeRef) -> (AXError, CFTypeRef?) {
+        var out: CFTypeRef?
+        let error = AXUIElementCopyParameterizedAttributeValue(focused, attribute as CFString, parameter, &out)
+        return (error, out)
+    }
+    func marker(_ value: CFTypeRef?) -> AXTextMarker? {
+        guard let value, CFGetTypeID(value) == AXTextMarkerGetTypeID() else {
+            return nil
+        }
+        return (value as! AXTextMarker)
+    }
+    func length(_ from: AXTextMarker, _ to: AXTextMarker) -> Int {
+        (param("AXLengthForTextMarkerRange", AXTextMarkerRangeCreate(kCFAllocatorDefault, from, to)).1 as? NSNumber)?.intValue ?? -1
+    }
+    func stringLength(_ from: AXTextMarker, _ to: AXTextMarker) -> Int {
+        (param("AXStringForTextMarkerRange", AXTextMarkerRangeCreate(kCFAllocatorDefault, from, to)).1 as? String)?.utf16.count ?? -1
+    }
+    func describe(_ value: AXTextMarker) -> String {
+        guard let text = param("AXTextMarkerDebugDescription", value).1 as? String else {
+            return "nil"
+        }
+        return String(text.replacingOccurrences(of: "\n", with: "⏎").prefix(160))
+    }
+    let selection = raw as! AXTextMarkerRange
+    let unordered = [AXTextMarkerRangeCopyStartMarker(selection), AXTextMarkerRangeCopyEndMarker(selection)] as CFArray
+    guard let orderedRaw = param("AXTextMarkerRangeForUnorderedTextMarkers", unordered).1, CFGetTypeID(orderedRaw) == AXTextMarkerRangeGetTypeID() else {
+        return "排不了序"
+    }
+    let ordered = orderedRaw as! AXTextMarkerRange
+    let first = AXTextMarkerRangeCopyStartMarker(ordered)
+    let last = AXTextMarkerRangeCopyEndMarker(ordered)
+    var steps = ["总长=\(length(first, last)) 整段字符串=\(stringLength(first, last)) 起点=\(describe(first)) 终点=\(describe(last))"]
+    var cursor = first
+    var reanchored = false
+    for step in 0..<6 {
+        let (error, value) = param("AXNextParagraphEndTextMarkerForTextMarker", cursor)
+        guard let end = marker(value) else {
+            steps.append("第\(step)步找段落结尾：代码 \(error.rawValue)")
+            break
+        }
+        let paragraph = length(cursor, end)
+        let index = param("AXIndexForTextMarker", end)
+        steps.append("第\(step)步：段长=\(paragraph) 字符串=\(stringLength(cursor, end)) 结尾索引="
+                     + (index.0 == .success ? "\((index.1 as? NSNumber)?.intValue ?? -1)" : "代码 \(index.0.rawValue)") + " 结尾=\(describe(end))")
+        guard paragraph == 0 else {
+            cursor = end
+            continue
+        }
+        // 和 Copi 一样：往后挪一个字再往前挪一个字，换成紧跟着的第一个字的开头（只换一次）
+        guard !reanchored, let next = marker(param("AXNextTextMarkerForTextMarker", cursor).1),
+              let start = marker(param("AXPreviousTextMarkerForTextMarker", next).1) else {
+            steps.append("换不了起点")
+            break
+        }
+        steps.append("换起点：间隔=\(length(cursor, start)) 往后一个字=\(describe(next)) 新起点=\(describe(start))")
+        reanchored = true
+        cursor = start
+    }
+    return steps.joined(separator: "；")
 }
 
 // 把键盘焦点放到网页上（不动选区）：浏览器打开新标签页时焦点有时留在地址栏
@@ -786,7 +940,7 @@ func runTests() throws {
     record("0.1", "Copi 菜单里的状态", "INFO", status.isEmpty ? "没有关闭、暂停、受限之类的提示"
            : status.joined(separator: " / ") + (settingsWarningBeforeTests ? "（测试前就有'设置被改'的警告：测试不会去点掉它）" : ""))
     let settings: [(String, Bool)] = [("isOn", true), ("overrideShortcuts", true), ("allowClipboardFallback", false), ("blockTextDragging", true),
-                                      ("clearOnLock", true), ("refuseTypingWhenWatched", false), ("instantClipboardDetection", false),
+                                      ("clearOnLock", true), ("refuseTypingWhenWatched", false), ("instantClipboardDetection", true),
                                       ("constantFastCheck", false), ("typePrivately", false), ("restartAfterCrash", true)]
     let settingsNote = settings.map { "\($0.0)=\(copiBool($0.0, $0.1))" }.joined(separator: " ") + " autoClearMinutes=\(copiDefault("autoClearMinutes") ?? "0")"
     record("0.3", "Copi 的设置", "INFO", settingsNote)
@@ -836,16 +990,18 @@ func runTests() throws {
             try gate(source)
             chord(keyA(), cmd)
             let menuCopy = try clickMenuItem(source, commandChar: "C")
+            let copyState = lastMenuClickState
             let watch = watchGeneralPasteboard(ms: 400)
             let destination = try openTextEdit("dst-menu.txt", "")
             openedWindows.append(destination)
             try gate(destination)
             let menuPaste = try clickMenuItem(destination, commandChar: "V")
+            let pasteState = lastMenuClickState
             sleepMS(700)
             let value = textValue(destination)
             let ok = menuCopy && menuPaste && !watch.sawText && value == "Menu copy line for Copi selftest"
             record("2.1", "编辑菜单 › 拷贝/粘贴", ok ? "PASS" : "FAIL",
-                   "点到菜单项：拷贝=\(menuCopy) 粘贴=\(menuPaste)；系统剪贴板出现文字=\(watch.sawText)（\(watch.sawForMS) ms）；\(describeDiff(value, "Menu copy line for Copi selftest"))")
+                   "点到菜单项：拷贝=\(menuCopy)（\(copyState)） 粘贴=\(menuPaste)（\(pasteState)）；系统剪贴板出现文字=\(watch.sawText)（\(watch.sawForMS) ms）；\(describeDiff(value, "Menu copy line for Copi selftest"))")
         }
 
         // ---- 3. 右键菜单的拷贝/粘贴 ----
@@ -966,7 +1122,8 @@ func runTests() throws {
             let paraKnown = short != "Safari" && (value ?? "").isEmpty && !watch.sawText
             record("\(short).1", "\(short) 网页 3 段正文（脚本选中）⌘C → TextEdit ⌘V", paraOK ? "PASS" : (paraKnown ? "KNOWN" : "FAIL"),
                    "按 ⌘C 前：\(paraDiag)；系统剪贴板出现文字=\(watch.sawText)；\(value == expectedWebKit ? "段落之间有空行（WebKit 的分段方式）" : describeDiff(value, expectedParagraphs))"
-                   + (paraKnown ? "（已知限制：这种脚本选区 Copi 拒绝复制，不泄露、不出错字）" : ""))
+                   + (paraKnown ? "（已知限制：这种脚本选区 Copi 拒绝复制，不泄露、不出错字）" : "")
+                   + (short != "Safari" && !paraOK ? "；逐段读：\(chromiumSelectionTrace(paragraph))" : ""))
 
             // 用鼠标拖选同样 3 段（和真人一样）
             let plain = try openPage(browser, mode: "plain")
@@ -1056,7 +1213,8 @@ func runTests() throws {
             let extra = lines.count - longLines.count
             let longKnown = short != "Safari" && longValue.isEmpty && !longWatch.sawText
             record("\(short).2", "\(short) 超长选区（脚本选中 401 段 + 末尾图标/按钮）", matching == longLines.count && !longWatch.sawText ? "PASS" : (longKnown ? "KNOWN" : "FAIL"),
-                   "按 ⌘C 前：\(longDiag)；前 \(matching)/\(longLines.count) 行逐字一致；之后多出 \(extra) 行（\(lines.dropFirst(longLines.count).joined(separator: "⏎").utf16.count) 字符）；系统剪贴板出现文字=\(longWatch.sawText)")
+                   "按 ⌘C 前：\(longDiag)；前 \(matching)/\(longLines.count) 行逐字一致；之后多出 \(extra) 行（\(lines.dropFirst(longLines.count).joined(separator: "⏎").utf16.count) 字符）；系统剪贴板出现文字=\(longWatch.sawText)"
+                   + (short != "Safari" && longValue.isEmpty ? "；逐段读：\(chromiumSelectionTrace(long))" : ""))
 
             // 粘贴进网页输入框：先在 TextEdit 里复制一段已知文字
             let (basicSource, _, _) = try copyFromTextEdit("src-\(short)-field.txt", basicText)
@@ -1068,6 +1226,30 @@ func runTests() throws {
                 chord(keyV(), cmd)
                 let (status, note) = fieldResult(page, field: field, expected: basicText)
                 record("\(short).3-\(field)", "\(short) ⌘V 粘贴进 \(field == "ta" ? "textarea" : "input")", status, note)
+            }
+            // input 里有落单的代理项、光标在开头：Chromium 读出来的值可能是空的。原有的 5 个字符还在算通过；
+            // 整个值被换成粘贴的文字是已知限制（Copi 分不清这种输入框和空输入框，见 spliceValue），其他结果算失败
+            if short != "Safari" {
+                let lonePage = try openPage(browser, mode: "lone-in")
+                openedWindows.append(lonePage)
+                try gate(lonePage)
+                chord(keyV(), cmd)
+                let want = "COPI|in|len=\(basicText.utf16.count + 5)|"
+                let title = waitTitle(lonePage, prefix: want) ?? "nil"
+                let loneKnown = title.contains("COPI|in|len=\(basicText.utf16.count)|h=\(djb2(basicText))")
+                record("\(short).3-lone", "\(short) ⌘V 粘贴进含落单代理项的 input（光标在开头）：原有内容还在", title.contains(want) ? "PASS" : (loneKnown ? "KNOWN" : "FAIL"),
+                       title.contains(want) ? "长度一致（\(basicText.utf16.count) + 5 字符）" : "页面标题 \(title.prefix(48))，期望 \(want)"
+                       + (loneKnown ? "（已知限制：读到的值是空的，整个输入框被换成了粘贴的文字）" : ""))
+                // 空 input 里粘贴 4500 个字：应该一步整体改写值。空输入框要照常走这条路，不该退回逐字键入
+                let bigText = String(repeating: "y", count: 4500)
+                let (bigSource, _, _) = try copyFromTextEdit("src-\(short)-field-big.txt", bigText)
+                openedWindows.append(bigSource)
+                let bigPage = try openPage(browser, mode: "focus-in")
+                openedWindows.append(bigPage)
+                try gate(bigPage)
+                chord(keyV(), cmd)
+                let (bigStatus, bigNote) = fieldResult(bigPage, field: "in", expected: bigText)
+                record("\(short).3-in-big", "\(short) ⌘V 粘贴 4500 个字进空的 input", bigStatus, bigNote)
             }
             // ⇧⌘V（Brave）/ ⌥⇧⌘V（Safari）
             let (variantSource, _, _) = try copyFromTextEdit("src-\(short)-variant.txt", basicText)
@@ -1095,6 +1277,25 @@ func runTests() throws {
             chord(keyV(), cmd)
             let (pwStatus, pwNote) = fieldResult(passwordPage, field: "pw", expected: passwordText)
             record("\(short).4", "\(short) ⌘V 粘贴进密码框（Secure Input）", pwStatus, pwNote)
+            // ⇧⌘V（Brave）/ ⌥⇧⌘V（Safari）粘贴进密码框：Secure Input 期间 tap 看不到按键，靠这两个键的热键接管。
+            // 用同一个页面（再开一页时 Safari 会弹出"是否存储密码"之类的提示打断）、换一段文字，清空密码框再粘贴
+            let pwVariantText = "CopiPw-456_variant"
+            let (pwVariantSource, _, _) = try copyFromTextEdit("src-\(short)-pw-variant.txt", pwVariantText)
+            openedWindows.append(pwVariantSource)
+            bringToFront(passwordPage)
+            sleepMS(500)
+            try gate(passwordPage)
+            chord(keyA(), cmd)
+            chord(CGKeyCode(kVK_Delete))
+            sleepMS(300)
+            try gate(passwordPage)
+            let pwSecureBefore = IsSecureEventInputEnabled()
+            chord(keyV(), short == "Brave" ? cmdShift : cmdShiftOpt)
+            let (pwVariantStatus, pwVariantNote) = fieldResult(passwordPage, field: "pw", expected: pwVariantText)
+            // 按键时 Secure Input 还没开：走的是按键拦截，热键这条路没测到
+            record("\(short).4s", short == "Brave" ? "Brave ⇧⌘V 粘贴进密码框" : "\(short) ⌥⇧⌘V 粘贴进密码框",
+                   pwVariantStatus == "PASS" && !pwSecureBefore ? "CHECK" : pwVariantStatus,
+                   pwVariantNote + "（按键时 Secure Input=\(pwSecureBefore)\(pwSecureBefore ? "" : "：热键这条路没测到")）")
         }
     }
 
@@ -1139,6 +1340,10 @@ func runTests() throws {
     if wants("vscode") {
         section("VS Code") { try vscodeTests(&openedWindows) }
     }
+    if wants("matrix") {
+        section("别的程序写剪贴板") { try clipboardMatrixTests(&openedWindows) }
+        section("复制不了、经过剪贴板的复制") { try copyMatrixTests(&openedWindows) }
+    }
     if wants("concealed") {
         section("密码管理器式复制") { try concealedTests(&openedWindows) }
     }
@@ -1154,8 +1359,12 @@ func runTests() throws {
     }
 }
 
+// 最近一次 clickMenuItem 点下去之前看到的（写进报告）：分辨"菜单没开、没点到""点了灰掉的项"和 Copi 自己的问题
+var lastMenuClickState = ""
+
 // 打开 App 的菜单，用鼠标点有这个快捷键（⌘ + commandChar）的菜单项
 func clickMenuItem(_ target: TestWindow, commandChar: String) throws -> Bool {
+    lastMenuClickState = ""
     let app = AXUIElementCreateApplication(target.pid)
     guard let menuBar = axElement(ax(app, kAXMenuBarAttribute)) else {
         return false
@@ -1176,15 +1385,26 @@ func clickMenuItem(_ target: TestWindow, commandChar: String) throws -> Bool {
         try gate(target)
         click(center(barFrame))
         sleepMS(500)
-        guard let openMenu = axChildren(barItem).first,
-              let item = axChildren(openMenu).first(where: {
-                  axString($0, kAXMenuItemCmdCharAttribute) == commandChar && (ax($0, kAXMenuItemCmdModifiersAttribute) as? NSNumber)?.intValue == 0
-              }),
-              let itemFrame = frame(item) else {
+        // 点之前确认菜单真的开着、那个位置就是这个菜单项（刚启动的 App 第一次打开菜单可能更慢，最多再等 1 秒）
+        var found: (item: AXUIElement, frame: CGRect)?
+        for _ in 0..<11 where found == nil {
+            if let openMenu = axChildren(barItem).first,
+               let item = axChildren(openMenu).first(where: {
+                   axString($0, kAXMenuItemCmdCharAttribute) == commandChar && (ax($0, kAXMenuItemCmdModifiersAttribute) as? NSNumber)?.intValue == 0
+               }),
+               let itemFrame = frame(item), isWithin(elementAt(center(itemFrame)), item) {
+                found = (item, itemFrame)
+            } else {
+                sleepMS(100)
+            }
+        }
+        guard let found else {
+            lastMenuClickState = "菜单没有打开（点的位置不是这个菜单项）"
             chord(CGKeyCode(kVK_Escape))
             return false
         }
-        click(center(itemFrame))
+        lastMenuClickState = "点之前菜单项可用=\((ax(found.item, kAXEnabledAttribute) as? Bool).map { "\($0)" } ?? "读不到")"
+        click(center(found.frame))
         sleepMS(300)
         return true
     }
@@ -1288,6 +1508,44 @@ func ttyProcessList() -> [(pid: String, tty: String, stat: String, name: String)
 }
 
 // 进程启动时的环境变量（KERN_PROCARGS2，和 Copi 读的方法一样；只能读同一用户的进程）
+// 进程的启动参数（KERN_PROCARGS2，和 processEnvironment 一样读）
+func processArguments(pid: pid_t) -> [String]? {
+    var argumentLimit: Int32 = 0
+    var limitSize = MemoryLayout<Int32>.size
+    var limitMIB: [Int32] = [CTL_KERN, KERN_ARGMAX]
+    guard sysctl(&limitMIB, 2, &argumentLimit, &limitSize, nil, 0) == 0, argumentLimit > 0 else {
+        return nil
+    }
+    var size = Int(argumentLimit)
+    var buffer = [UInt8](repeating: 0, count: size)
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else {
+        return nil
+    }
+    var argumentCount = 0
+    for (offset, byte) in buffer.prefix(MemoryLayout<Int32>.size).enumerated() {
+        argumentCount |= Int(byte) << (8 * offset)
+    }
+    var index = MemoryLayout<Int32>.size
+    while index < size, buffer[index] != 0 {
+        index += 1
+    }
+    while index < size, buffer[index] == 0 {
+        index += 1
+    }
+    var arguments: [String] = []
+    while argumentCount > 0, index < size {
+        let start = index
+        while index < size, buffer[index] != 0 {
+            index += 1
+        }
+        arguments.append(String(decoding: buffer[start..<index], as: UTF8.self))
+        index += 1
+        argumentCount -= 1
+    }
+    return arguments
+}
+
 func processEnvironment(pid: pid_t) -> [String: String]? {
     var argumentLimit: Int32 = 0
     var limitSize = MemoryLayout<Int32>.size
@@ -1346,14 +1604,32 @@ func isTestShell(pid: String) -> Bool {
     return zdot == fixtures.appendingPathComponent("zdot").path || zdot.hasSuffix("/selftest/fixtures/zdot")
 }
 
-// 这个终端设备上前台只有测试会用到的程序（测试 shell、tmux、假 sudo）
+// 这个终端设备上前台只有测试会用到的程序（测试 shell、T.3 的 /bin/bash、tmux、假 sudo）
 func terminalForegroundIsOurs(_ tty: String) -> Bool {
     let foreground = ttyProcessList().filter { $0.tty == tty && $0.stat.contains("+") }.map(\.name)
-    return !foreground.isEmpty && foreground.allSatisfy { ["zsh", "tmux", "sudo"].contains($0) }
+    return !foreground.isEmpty && foreground.allSatisfy { ["zsh", "bash", "tmux", "sudo"].contains($0) || testForegroundProgram($0) }
+}
+
+// 测试自己在测试 shell 里启动的程序（Neovim、Python）：它在前台时测试窗口照样算是对的
+var testForegroundProgram: (String) -> Bool = { _ in false }
+
+// 测试 shell 里由测试启动、还没退出的程序：先 SIGTERM（让它自己恢复终端设置），2 秒后还在就 SIGKILL
+func stopTestPrograms(on tty: String, _ matches: (String) -> Bool) {
+    for signal in [SIGTERM, SIGKILL] {
+        let leftover = ttyProcessList().filter { $0.tty == tty && matches($0.name) }.compactMap { pid_t($0.pid) }
+        guard !leftover.isEmpty else {
+            return
+        }
+        leftover.forEach { kill($0, signal) }
+        sleepMS(2000)
+    }
 }
 
 // 打开测试用的 Terminal 窗口：认准"新出现的那一个窗口"+"新出现的那一个终端设备，前台是测试用的 zsh"。
 // Terminal 原本没在运行时先打开它、等它恢复上次的窗口，免得把恢复出来的窗口当成测试窗口。others：Terminal 里别的窗口、标签页数
+// 上一次没打开测试窗口时看到的数量（只有数字：多出来的窗口、新终端设备、其中的测试 shell）
+var lastTerminalOpenCounts = ""
+
 func openTestTerminal() -> (term: TestWindow, others: Int, tty: String)? {
     if pids(terminal.0).isEmpty {
         _ = run("/usr/bin/open", ["-a", terminal.1])
@@ -1374,7 +1650,12 @@ func openTestTerminal() -> (term: TestWindow, others: Int, tty: String)? {
     let existing = pids(terminal.0).flatMap { windows($0) }
     let ttysBefore = Set(ttyProcessList().map(\.tty))
     openWith(terminal.1, command.path)
-    let deadline = Date().addingTimeInterval(20)
+    var deadline = Date().addingTimeInterval(20)
+    // 有的 shell 启动时丢掉排进来的命令，Terminal 打开 .command 只剩一个空窗口：12 秒后还没看到测试 shell，就在这个窗口里
+    // 自己打启动命令；连窗口都没有时改用 Terminal 的脚本接口（第一次会问要不要允许测试程序控制 Terminal）
+    var triedScript = terminal.0 != "com.apple.Terminal"
+    var scriptResult = "没试"
+    let fallbackAt = Date().addingTimeInterval(12)
     while Date() < deadline {
         let processes = ttyProcessList()
         let newTTYs = Set(processes.map(\.tty)).subtracting(ttysBefore)
@@ -1394,6 +1675,57 @@ func openTestTerminal() -> (term: TestWindow, others: Int, tty: String)? {
             term.contentCheck = { terminalTabCount(window) == 1 && terminalForegroundIsOurs(tty) }
             return (term, windows(pid).count - 1 + terminalTabCount(window) - 1, tty)
         }
+        // 新终端设备上的前台进程：有几个、其中几个叫 zsh、几个 zsh 读得到环境变量（只记数量，不记进程名）
+        let foreground = processes.filter { newTTYs.contains($0.tty) && $0.stat.contains("+") }
+        let zshes = foreground.filter { $0.name == "zsh" }
+        let readable = zshes.filter { pid_t($0.pid).flatMap { processEnvironment(pid: $0) } != nil }.count
+        let withZDOTDIR = zshes.filter { pid_t($0.pid).flatMap { processEnvironment(pid: $0)?["ZDOTDIR"] } != nil }.count
+        let withPATH = zshes.filter { pid_t($0.pid).flatMap { processEnvironment(pid: $0)?["PATH"] } != nil }.count
+        // 只记是/否：新窗口里有没有出现测试 shell 的提示符（copitest…），不记窗口里别的内容
+        let testPrompt = newWindows.contains { (pid, window) in
+            (textValue(TestWindow(bundleID: terminal.0, appName: terminal.1, pid: pid, window: window)) ?? "").contains("copitest")
+        }
+        let ranScript = processes.filter { newTTYs.contains($0.tty) }
+            .contains { pid_t($0.pid).flatMap { processArguments(pid: $0) }?.contains { $0.hasSuffix("copiterm.command") } == true }
+        if !triedScript, Date() > fallbackAt, testTTYs.isEmpty {
+            triedScript = true
+            let dir = fixtures.path.replacingOccurrences(of: "'", with: "")
+            let command = "cd '\(dir)' && export ZDOTDIR='\(dir)/zdot' && exec /bin/zsh -i"
+            if newWindows.count == 1, newTTYs.count == 1, foreground.count == 1 {
+                // 有的 shell 启动时丢掉之前排进来的命令（.command、脚本接口送进去的都是）：等它停在提示符前，在这个新窗口里自己把命令打进去，
+                // 和用户手动输入一样。打字前照样确认焦点在这个窗口上
+                let (pid, window) = newWindows[0]
+                let fresh = TestWindow(bundleID: terminal.0, appName: terminal.1, pid: pid, window: window)
+                bringToFront(fresh)
+                if (try? gate(fresh)) != nil {
+                    // 打字时用英文输入法（中文输入法会把字母变成候选字），打完切回
+                    let previousSource = currentInputSourceID()
+                    let switched = previousSource != "com.apple.keylayout.ABC" && selectInputSource("com.apple.keylayout.ABC")
+                    typeText(command)
+                    sleepMS(300)
+                    // 只记是/否：窗口里看不看得到这条启动命令（不记窗口里别的内容）
+                    let echoed = (textValue(fresh) ?? "").contains("ZDOTDIR=")
+                    pressReturn()
+                    if switched, let previousSource {
+                        _ = selectInputSource(previousSource)
+                    }
+                    scriptResult = "在新窗口里打了启动命令（窗口里看得到这条命令=\(echoed)；换过英文输入法=\(switched)）"
+                } else {
+                    scriptResult = "新窗口没拿到焦点，没打启动命令"
+                }
+            } else {
+                let result = run("/usr/bin/osascript", ["-e", "tell application \"Terminal\" to do script \"\(command)\""], timeout: 60)
+                // 只记退出码和 AppleScript 的错误号（-1743：没有允许控制 Terminal），不记输出
+                let code = result.output.range(of: #"\((-?\d+)\)"#, options: .regularExpression).map { String(result.output[$0]) } ?? ""
+                scriptResult = result.status == 0 ? "脚本接口成功" : "脚本接口失败（退出码 \(result.status)\(code.isEmpty ? "" : "，错误 " + code)）"
+            }
+            deadline = Date().addingTimeInterval(20)
+            continue
+        }
+        lastTerminalOpenCounts = "新窗口 \(newWindows.count) 个、新终端设备 \(newTTYs.count) 个、其中测试 shell \(testTTYs.count) 个；"
+            + "新终端设备上的前台进程 \(foreground.count) 个、zsh \(zshes.count) 个、读得到环境变量的 zsh \(readable) 个、"
+            + "设了 ZDOTDIR 的 \(withZDOTDIR) 个、读得到 PATH 的 \(withPATH) 个；窗口里出现测试提示符=\(testPrompt)；"
+            + "有进程在运行测试的启动脚本=\(ranScript)；后备做法：\(scriptResult)"
         sleepMS(250)
     }
     return nil
@@ -1410,7 +1742,7 @@ func terminalTests(_ openedWindows: inout [TestWindow], app terminal: (String, S
         record("\(T).0", "Terminal 其他标签页", "INFO", "有 \(busy) 个前台程序不是 shell：Copi 按窗口标题判断前台程序，结果可能受影响")
     }
     guard let opened = openTestTerminal() else {
-        record(T, terminal.1, "SKIP", "\(terminal.1) 没有打开测试用的新窗口（新窗口、新终端设备上的测试 shell 都要正好一个）")
+        record(T, terminal.1, "SKIP", "\(terminal.1) 没有打开测试用的新窗口（新窗口、新终端设备上的测试 shell 都要正好一个；看到的是：\(lastTerminalOpenCounts)）")
         return
     }
     let term = opened.term
@@ -1444,12 +1776,30 @@ func terminalTests(_ openedWindows: inout [TestWindow], app terminal: (String, S
         sleepMS(400)
     }
 
+    // 虚拟机上出错时写出终端最后的一段（测试 shell 的提示符和测试命令，没有别的内容），看出是没打进去、打晚了还是回车没到
+    func screenTail() -> String {
+        onCI ? "；终端末尾=" + String(terminalText(term).suffix(120)).debugDescription : ""
+    }
+
     // 单行：插入，不执行；回车后内容完整
     try paste("touch \(dir)/t1", "src-term-1.txt")
     let ran1 = exists("t1")
+    let beforeEnter1 = screenTail()
     try enter()
-    record("\(T).1", "\(terminal.1) 单行粘贴：插入不执行、内容完整", !ran1 && exists("t1") ? "PASS" : "FAIL",
-           "按回车前就被执行了=\(ran1)；按回车后命令完整执行（标记文件在）=\(exists("t1"))")
+    let ok1 = !ran1 && exists("t1")
+    record("\(T).1", "\(terminal.1) 单行粘贴：插入不执行、内容完整", ok1 ? "PASS" : "FAIL",
+           "按回车前就被执行了=\(ran1)；按回车后命令完整执行（标记文件在）=\(exists("t1"))" + (ok1 ? "" : "（回车前\(beforeEnter1)）（回车后\(screenTail())）"))
+
+    // 单行里夹着 Tab：zsh 里包成 bracketed paste 键入，Tab 原样插入；回车后文件里正好是 a⇥b。Tab 放在引号里：
+    // 在标记外面键入的话补全会吞掉它或者补出别的东西，内容就不对
+    try paste("printf '%s' 'a\tb' > \(dir)/t1t", "src-term-tab.txt")
+    let ranTab = exists("t1t")
+    try enter()
+    let tabContent = try? String(contentsOf: markers.appendingPathComponent("t1t"), encoding: .utf8)
+    record("\(T).1t", "\(terminal.1) 单行粘贴夹着 Tab：插入不执行、Tab 原样保留", !ranTab && tabContent == "a\tb" ? "PASS" : "FAIL",
+           "按回车前就被执行了=\(ranTab)；按回车后文件内容=\(tabContent?.debugDescription ?? "没有文件")"
+           // 出错时分清是哪一种：上一项的命令留在行上、和这一项拼成一行执行（会建出 t1printf），还是上一项的回车成了粘贴里的换行（t1 这时才出现）
+           + (tabContent == "a\tb" ? "" : "；拼成一行（t1printf 在）=\(exists("t1printf"))；t1 现在在=\(exists("t1"))" + screenTail()))
 
     // 多行：插入，不执行；回车后两行都执行
     try paste("touch \(dir)/t2a\ntouch \(dir)/t2b", "src-term-2.txt")
@@ -1458,19 +1808,222 @@ func terminalTests(_ openedWindows: inout [TestWindow], app terminal: (String, S
     record("\(T).2", "\(terminal.1) 多行粘贴：插入不执行、内容完整", !ran2 && exists("t2a") && exists("t2b") ? "PASS" : "FAIL",
            "按回车前就被执行了=\(ran2)；按回车后两行都执行=\(exists("t2a") && exists("t2b"))")
 
-    // 打字中断：Copi 打字时按回车，应停下、不执行（标记命令在最后，只有整行打完并执行才会出现）
-    if terminal.0 == "com.apple.Terminal" {
-        let longCommand = ": " + String(repeating: "x", count: 4000) + "; touch \(dir)/t3"
-        let (source, _, _) = try copyFromTextEdit("src-term-3.txt", longCommand)
-        openedWindows.append(source)
+    // 前台是 Neovim：通过它自己的 RPC 接口粘贴，和真正的粘贴一样（README："pastes through Neovim's own RPC socket"）。
+    // 普通模式里粘贴带括号、引号、缩进的两行，存盘退出，看文件内容；系统剪贴板上一直没有文字
+    if let nvim = ["/opt/homebrew/bin/nvim", "/usr/local/bin/nvim"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+        let file = markers.appendingPathComponent("t9.txt")
+        try? FileManager.default.removeItem(at: file)
+        try gate(term)
+        // Neovim 在前台时测试窗口照样算对；不管这一项怎么结束，都不让它留在测试 shell 里（后面的项目要回到提示符）
+        testForegroundProgram = { $0 == "nvim" }
+        defer {
+            stopTestPrograms(on: opened.tty) { $0 == "nvim" }
+            testForegroundProgram = { _ in false }
+        }
+        typeText("\(nvim) --clean -n \(dir)/t9.txt")
+        pressReturn()
+        sleepMS(2500)
+        let text9 = "alpha (one)\n  beta \"two\""
+        let (source9, _, _) = try copyFromTextEdit("src-term-9.txt", text9)
+        openedWindows.append(source9)
         bringToFront(term)
         try gate(term)
+        let watcher = TypeWatcher(.general) { $0.contains(NSPasteboard.PasteboardType.string.rawValue) }
         chord(keyV(), cmd)
-        sleepMS(80)
+        sleepMS(2500)
+        let presence = watcher.stop().presence
+        try gate(term)
+        chord(CGKeyCode(kVK_Escape))
+        sleepMS(300)
+        typeText(":wq")
         pressReturn()
-        sleepMS(8000)
-        record("\(T).3", "\(terminal.1) 打字中按回车：停止、不执行", exists("t3") ? "FAIL" : "PASS", "整行打完并执行了=\(exists("t3"))")
+        sleepMS(1500)
+        let content = try? String(contentsOf: file, encoding: .utf8)
+        record("\(T).9", "\(terminal.1) 里前台是 Neovim：通过它自己的接口粘贴两行（不键入、不经过剪贴板），内容完整",
+               content == text9 + "\n" && presence.first == nil ? "PASS" : "FAIL",
+               "存盘后的文件=\(content.map { "\($0.utf16.count) 字符\($0 == text9 + "\n" ? "，一致" : "，不一致：\($0.debugDescription)")" } ?? "没有")；\(presence.summary("文字"))")
+    } else {
+        record("\(T).9", "\(terminal.1) 里前台是 Neovim", "SKIP", "没有安装 Neovim")
+    }
+
+    // 前台程序在按行读（Python 的 input()）：单行照常打进去，回车之前不执行（README："single lines are typed when the program is reading a whole line"）
+    if FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") {
+        try? FileManager.default.removeItem(at: markers.appendingPathComponent("t10"))
+        try gate(term)
+        // /usr/bin/python3 运行起来的进程名是 Python 或 python3.x
+        let isPython: (String) -> Bool = { $0.lowercased().hasPrefix("python") }
+        testForegroundProgram = isPython
+        defer {
+            stopTestPrograms(on: opened.tty, isPython)
+            testForegroundProgram = { _ in false }
+        }
+        // 先读到这一行再建文件（写成 open(...).write(input()) 的话，文件在等输入之前就建好了）
+        typeText("/usr/bin/python3 -c 's=input(); open(\"\(dir)/t10\", \"w\").write(s)'")
+        pressReturn()
+        sleepMS(3000)
+        let line10 = "copi line (a) \"b\" $HOME"
+        try paste(line10, "src-term-10.txt", wait: 3000)
+        let early10 = exists("t10")
+        try enter()
+        sleepMS(500)
+        let content10 = try? String(contentsOf: markers.appendingPathComponent("t10"), encoding: .utf8)
+        record("\(T).10", "\(terminal.1) 里程序在等输入一行（Python 的 input()）：单行原样打进去，回车之前什么都不发生",
+               !early10 && content10 == line10 ? "PASS" : "FAIL",
+               "回车前就有结果=\(early10)；收到的=\(content10.map { $0 == line10 ? "一致" : $0.debugDescription } ?? "没有")")
         try clearLine()
+    }
+
+    // 在等单个按键（zsh 的 read -q）时粘贴 "yx"：一个字都不送。之后按回车回答它：回答是 n 说明什么都没送进去，
+    // 是 y 说明粘贴的第一个字符回答了它（后面的 x 落到下一个提示符，回车执行它只会报找不到命令）
+    try gate(term)
+    typeText("read -q REPLY; print -r -- $REPLY > \(dir)/t8")
+    pressReturn()
+    sleepMS(1000)
+    try paste("yx", "src-term-8.txt")
+    try enter()
+    let answer8 = (try? String(contentsOf: markers.appendingPathComponent("t8"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+    record("\(T).8", "\(terminal.1) 在等单个按键（zsh 的 read -q）时粘贴：一个字都不送", answer8 == "n" ? "PASS" : "FAIL",
+           "提示得到的回答=\(answer8 ?? "没有")（n：粘贴什么都没送，回车回答了它；y：粘贴的第一个字符回答了它）")
+    try clearLine()
+
+    // 打字中断：Copi 打字时按下的回车被拦下、打字停下。zsh 里单行是包成 bracketed paste 打的，漏进去的回车只是换行，测不出来：
+    // 换成不认 bracketed paste 的 /bin/bash 3.2（不读配置、不存历史）。
+    // （之前这里粘贴的一行有 4020 个字符，超过 Copi 键入的上限 4000：Copi 直接拒绝、一个字都没打，这一项其实什么都没测到）
+    if terminal.0 == "com.apple.Terminal" {
+        try gate(term)
+        typeText("HISTFILE=/dev/null /bin/bash --norc --noprofile")
+        pressReturn()
+        sleepMS(1500)
+        // 打到一半停下时打出来的是开头那一段：t3a 在开头，t3b 在最后
+        let line = "touch \(dir)/t3a; : " + String(repeating: "x", count: 3800) + "; touch \(dir)/t3b"
+        let (source, _, _) = try copyFromTextEdit("src-term-3.txt", line)
+        openedWindows.append(source)
+        bringToFront(term)
+        let lengthBefore = terminalText(term).utf16.count
+        try gate(term)
+        chord(keyV(), cmd)
+        // 看到开始打字（终端里的文字变长）再按回车，看不到就 1.5 秒后按
+        var sawTyping = false
+        for _ in 0..<30 where !sawTyping {
+            sleepMS(50)
+            sawTyping = terminalText(term).utf16.count > lengthBefore + 200
+        }
+        try gate(term)
+        pressReturn()
+        sleepMS(2500)
+        let ranEarly = (exists("t3a"), exists("t3b"))
+        // 再按一次回车：执行停下时打出来的那一段
+        try gate(term)
+        pressReturn()
+        sleepMS(1500)
+        let ranLater = (exists("t3a"), exists("t3b"))
+        let status: String
+        let note: String
+        if ranEarly.0 || ranEarly.1 {
+            status = ranEarly.1 ? "CHECK" : "FAIL"
+            note = ranEarly.1 ? "按回车时整行已经打完了（这一项没测到）" : "打字时按下的回车把打了一半的命令执行了"
+        } else if ranLater.0 && !ranLater.1 {
+            status = "PASS"
+            note = "回车被拦下、打字停在中间；再按一次回车执行的是打出来的前半段"
+        } else {
+            status = ranLater.1 ? "FAIL" : "CHECK"
+            note = ranLater.1 ? "第一次回车之后打字没有停下，整行都打完了" : "两次回车之后都没有执行（回车可能按得太早，打字还没开始）"
+        }
+        record("\(T).3", "\(terminal.1) 里 Copi 打字时按回车（/bin/bash 3.2）：回车被拦下、打字停下", status,
+               "\(note)；看到开始打字=\(sawTyping)；第一次回车后 t3a=\(ranEarly.0) t3b=\(ranEarly.1)，第二次回车后 t3a=\(ranLater.0) t3b=\(ranLater.1)")
+        try clearLine()
+
+        // 打字时又按了一次 ⌘V：⌘ 一按下打字就停（和按别的键一样），这一次什么都不粘贴，不能成了"打了一半的那段 + 一整段"。
+        // t3e 在开头，t3f 在最后；第一段在第二次 ⌘V 之前就打完了的话，两段首尾相接成 t3ftouch
+        let doubleLine = "touch \(dir)/t3e; : " + String(repeating: "x", count: 3800) + "; touch \(dir)/t3f"
+        let (doubleSource, _, _) = try copyFromTextEdit("src-term-3e.txt", doubleLine)
+        openedWindows.append(doubleSource)
+        bringToFront(term)
+        let doubleBefore = terminalText(term).utf16.count
+        try gate(term)
+        chord(keyV(), cmd)
+        var sawDoubleTyping = false
+        for _ in 0..<30 where !sawDoubleTyping {
+            sleepMS(50)
+            sawDoubleTyping = terminalText(term).utf16.count > doubleBefore + 200
+        }
+        try gate(term)
+        chord(keyV(), cmd)
+        // 等打字停下：终端里的文字 1.2 秒不再变长（最多等 15 秒）
+        var doubleLast = -1
+        var doubleStableSince = Date()
+        let doubleDeadline = Date().addingTimeInterval(15)
+        while Date() < doubleDeadline {
+            sleepMS(200)
+            let now = terminalText(term).utf16.count
+            if now != doubleLast {
+                doubleLast = now
+                doubleStableSince = Date()
+            } else if Date().timeIntervalSince(doubleStableSince) > 1.2 {
+                break
+            }
+        }
+        let doubleTyped = max(0, doubleLast - doubleBefore)
+        try enter()
+        let (ranFirst, ranLast, joined) = (exists("t3e"), exists("t3f"), exists("t3ftouch"))
+        let doubleStatus: String
+        let doubleNote: String
+        if ranFirst && !ranLast {
+            doubleStatus = "PASS"
+            doubleNote = "打字停在中间，第二次 ⌘V 没有再粘贴；回车执行的是打出来的前半段"
+        } else if joined {
+            doubleStatus = "CHECK"
+            doubleNote = "第二次 ⌘V 之前整行已经打完了（这一项没测到）"
+        } else if ranLast, sawDoubleTyping, doubleTyped > doubleLine.utf16.count + 100 {
+            doubleStatus = "FAIL"
+            doubleNote = "打字停下之后第二次 ⌘V 又打了一整行：成了半段加一整段"
+        } else if ranLast, sawDoubleTyping {
+            // 第二次 ⌘V 的 ⌘ 没有让打字停下（或者按下时已经打完、还没收尾），第二次被拒绝：没有混在一起，只是"⌘ 让打字停下"这一半没测到
+            doubleStatus = "INFO"
+            doubleNote = "第一次打完了整行，第二次 ⌘V 没有再粘贴（打字没有在 ⌘ 按下时停下）"
+        } else {
+            doubleStatus = "CHECK"
+            doubleNote = ranLast ? "只打出了一整行（第二次 ⌘V 可能按得太早，第一次还没开始打字）" : "回车后什么都没执行"
+        }
+        record("\(T).3e", "\(terminal.1) 里 Copi 打字时又按 ⌘V（/bin/bash 3.2）：打字停下，这一次不粘贴", doubleStatus,
+               "\(doubleNote)；看到开始打字=\(sawDoubleTyping)；终端里多出 \(doubleTyped) 个字符（整行 \(doubleLine.utf16.count) 个）；t3e=\(ranFirst) t3f=\(ranLast) t3ftouch=\(joined)")
+        try clearLine()
+
+        // 键入不限长度：4100 和 12000 个字符的一行都完整打出来（README："There is no length limit"）
+        for (count, marker) in [(4100, "t3c"), (12000, "t3d")] {
+            let tail = "; touch \(dir)/\(marker)"
+            let text = ": " + String(repeating: "y", count: count - 2 - tail.utf16.count) + tail
+            let (lengthSource, _, _) = try copyFromTextEdit("src-term-3-\(count).txt", text)
+            openedWindows.append(lengthSource)
+            bringToFront(term)
+            try gate(term)
+            chord(keyV(), cmd)
+            // 等打完：终端里的文字 1.2 秒不再变长（最多等 60 秒）
+            var last = -1
+            var stableSince = Date()
+            let deadline = Date().addingTimeInterval(60)
+            while Date() < deadline {
+                sleepMS(200)
+                let now = terminalText(term).utf16.count
+                if now != last {
+                    last = now
+                    stableSince = Date()
+                } else if now > 0, Date().timeIntervalSince(stableSince) > 1.2 {
+                    break
+                }
+            }
+            try enter()
+            let ran = exists(marker)
+            record("\(T).3\(count > 5000 ? "d" : "c")", "\(terminal.1) 粘贴一行 \(count) 个字符：完整打出来", ran ? "PASS" : "FAIL",
+                   "回车后执行了（标记文件在）=\(ran)；终端里约 \(last) 个字符")
+            try clearLine()
+        }
+
+        // 退出 bash，回到测试用的 zsh
+        try gate(term)
+        typeText("exit")
+        pressReturn()
+        sleepMS(1000)
     }
 
     // 浏览器里复制的文字粘到终端：第一次只询问，8 秒内再按一次才粘贴
@@ -1587,15 +2140,16 @@ func openCopiMenu() -> (pid: pid_t, app: AXUIElement)? {
 }
 
 // Copi 的面板现在在不在屏幕上：问窗口服务器（关上之后它的窗口还留在辅助功能的窗口列表里）。
-// 菜单栏图标本身也是 Copi 的窗口，只算比它高的
+// 菜单栏图标本身也是 Copi 的窗口，只算比它高的；屏幕下方显示进度、提醒的小窗口（宽 420 点）不算
 func copiPanelIsOpen(_ pid: pid_t) -> Bool {
     let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
     return list.contains { info in
         guard (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
-              let bounds = info[kCGWindowBounds as String] as? [String: Any], let height = (bounds["Height"] as? NSNumber)?.doubleValue else {
+              let bounds = info[kCGWindowBounds as String] as? [String: Any], let height = (bounds["Height"] as? NSNumber)?.doubleValue,
+              let width = (bounds["Width"] as? NSNumber)?.doubleValue else {
             return false
         }
-        return height > 60
+        return height > 60 && Int(width.rounded()) != 420
     }
 }
 
@@ -1674,9 +2228,10 @@ func dismissCopiWarning() -> Bool {
         return false
     }
     var rest = String(text.dropFirst(prefix.count)).replacingOccurrences(of: "Check them below and change them back if you didn't do this.", with: "")
-    for ours in ["Copi was turned off", "Allow Clipboard Fallback was turned on"] {
+    for ours in ["Copi was turned off", "Allow Clipboard Fallback was turned on", "Override ⌘C/⌘V was turned off", "Block Dragging Text was turned off"] {
         rest = rest.replacingOccurrences(of: ours, with: "")
     }
+    rest = rest.replacingOccurrences(of: "“TextEdit” was added to Apps Using the Normal Clipboard", with: "")
     guard !rest.unicodeScalars.contains(where: { CharacterSet.letters.contains($0) }) else {
         return false
     }
@@ -1765,24 +2320,26 @@ func itermTests(_ openedWindows: inout [TestWindow]) throws {
     }
     func check(_ id: String, _ name: String, files: [String]) throws {
         let ranEarly = files.contains(where: exists)
+        // GitHub 的虚拟机上：别的终端设备上的前台程序（Copi 看不出焦点在 iTerm2 的哪个会话，要靠窗口标题挑出这一个）
+        let context = onCI
+            ? "；窗口标题=\(axString(term.window, kAXTitleAttribute) ?? "nil")；别的终端设备上的前台程序="
+              + ttyProcesses().filter { !newTTYs.contains($0.tty) && $0.stat.contains("+") }.map(\.name).sorted().joined(separator: ",")
+            : ""
         try gate(term)
         pressReturn()
         sleepMS(1500)
         let allThere = files.allSatisfy(exists)
         record(id, name, !ranEarly && allThere ? "PASS" : "FAIL",
-               "按回车前就被执行了=\(ranEarly)；按回车后命令完整执行（标记文件都在）=\(allThere)")
+               "按回车前就被执行了=\(ranEarly)；按回车后命令完整执行（标记文件都在）=\(allThere)" + context)
     }
     // 测试 shell 的当前目录就是 fixtures：用相对路径
     let dir = "markers"
     try paste("touch '\(dir)/i1'", "src-iterm-1.txt")
     try check("I.1", "iTerm2 单行粘贴：插入不执行、内容完整", files: ["i1"])
-    if onCI {
-        // README：没法用 iTerm2 自己的接口时，多行文字只在 Terminal、kitty、WezTerm、Alacritty 里键入
-        record("I.2", "iTerm2 多行粘贴", "N/A", "GitHub 的虚拟机上没有允许 Copi 控制 iTerm2，按 README 多行文字不键入；这一项只在本机测")
-    } else {
-        try paste("touch '\(dir)/i2a'\ntouch '\(dir)/i2b'", "src-iterm-2.txt")
-        try check("I.2", "iTerm2 多行粘贴：插入不执行、内容完整", files: ["i2a", "i2b"])
-    }
+    // 没有允许 Copi 控制 iTerm2 时（GitHub 的虚拟机上就是这样），多行文字逐键打成 bracketed paste（ZeroExposure.swift 的
+    // keystrokeBracketedPasteTerminalBundleIDs 里有 iTerm2）
+    try paste("touch '\(dir)/i2a'\ntouch '\(dir)/i2b'", "src-iterm-2.txt")
+    try check("I.2", "iTerm2 多行粘贴：插入不执行、内容完整" + (onCI ? "（没有允许 Copi 控制 iTerm2：逐键键入）" : ""), files: ["i2a", "i2b"])
     // tmux（Copi 要经 iTerm2 自己的接口认出是哪个标签页：GitHub 的虚拟机上没法允许 Copi 控制 iTerm2，不测）
     if onCI {
         record("I.3", "iTerm2 + tmux", "N/A", "GitHub 的虚拟机上没有允许 Copi 控制 iTerm2（Copi 菜单里的 Terminal Access），这一项只在本机测")
@@ -1887,6 +2444,79 @@ func watchdogTests() {
            replaced.map { "被暂停的 \(paused) 换成了 \($0)" } ?? "35 秒内没有被换掉（已发送 SIGCONT 恢复）")
 }
 
+// MARK: - 测完收拾
+
+// 测试开始前这些 App 在不在运行、各开着哪些窗口；测完：测试启动的 App 整个退出（访达除外），原本就开着的只关测试期间新开的窗口，
+// 浏览器里关掉测试页的标签页。你原来的窗口不碰（窗口标题不记、不写进报告）
+final class WindowSnapshot {
+    private let appIDs = [textEdit.0, "com.apple.Safari", brave.0, "com.google.Chrome", "com.apple.Terminal", "com.googlecode.iterm2",
+                          "com.microsoft.VSCode", "com.apple.Preview", "com.apple.finder", "com.apple.ScreenSharing"]
+    private var running: Set<String> = []
+    private var windowsAtStart: [String: [AXUIElement]] = [:]
+
+    init() {
+        for id in appIDs {
+            let found = pids(id)
+            if !found.isEmpty {
+                running.insert(id)
+                windowsAtStart[id] = found.flatMap { windows($0) }
+            }
+        }
+    }
+
+    func restore() {
+        for id in appIDs {
+            let found = pids(id)
+            guard !found.isEmpty else {
+                continue
+            }
+            if !running.contains(id), id != "com.apple.finder" {
+                for pid in found {
+                    // TextEdit、预览里只有测试文档：直接结束（正常退出会弹"要不要保存"、卡在那里）。别的 App 正常退出
+                    if [textEdit.0, "com.apple.Preview"].contains(id) {
+                        NSRunningApplication(processIdentifier: pid)?.forceTerminate()
+                    } else {
+                        NSRunningApplication(processIdentifier: pid)?.terminate()
+                    }
+                }
+                continue
+            }
+            let before = windowsAtStart[id] ?? []
+            for pid in found {
+                for window in windows(pid) {
+                    let isNew = !before.contains { CFEqual($0, window) }
+                    let isTestPage = (axString(window, kAXTitleAttribute) ?? "").contains("COPI|")
+                    guard isNew || isTestPage else {
+                        continue
+                    }
+                    let target = TestWindow(bundleID: id, appName: "", pid: pid, window: window)
+                    if isTestPage, !isNew {
+                        // 你原来的浏览器窗口里测试开的标签页：只关这个标签页
+                        bringToFront(target)
+                        closeTab(target)
+                    } else if let close = axElement(ax(window, kAXCloseButtonAttribute)) {
+                        AXUIElementPerformAction(close, kAXPressAction as CFString)
+                        sleepMS(500)
+                        // 测试开的文档窗口问要不要保存：不保存（只在这个窗口自己的对话框里点）
+                        dismissSaveSheet(window)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 窗口上"要不要保存"的对话框：点"不存储"（或"删除""还原更改"）。只看这个窗口自己的对话框
+func dismissSaveSheet(_ window: AXUIElement) {
+    let titles = ["Don't Save", "Delete", "Revert Changes", "不存储", "删除", "还原更改", "不儲存", "刪除"]
+    for child in axChildren(window) where axString(child, kAXRoleAttribute) == "AXSheet" {
+        if let button = findDescendant(child, maxDepth: 6, { axString($0, kAXRoleAttribute) == kAXButtonRole && titles.contains(axString($0, kAXTitleAttribute) ?? "") }) {
+            AXUIElementPerformAction(button, kAXPressAction as CFString)
+            sleepMS(300)
+        }
+    }
+}
+
 // MARK: - 入口
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1900,6 +2530,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         Thread {
             var aborted: String?
+            let leftAsFound = WindowSnapshot()
+            defer { leftAsFound.restore() }
             do {
                 try runTests()
             } catch let error as Abort {
@@ -1914,9 +2546,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
             formatter.timeZone = .current
-            let copiLog = run("/usr/bin/log", ["show", "--start", formatter.string(from: startTime), "--style", "compact",
-                                               "--predicate", "subsystem == \"com.gokoding.Copi\""], timeout: 60).output
-            try? copiLog.write(to: baseDir.appendingPathComponent("copi.log"), atomically: true, encoding: .utf8)
+            // 只在 GitHub 的虚拟机上收集：你的电脑上的系统日志不读
+            if onCI {
+                let copiLog = run("/usr/bin/log", ["show", "--start", formatter.string(from: startTime), "--style", "compact",
+                                                   "--predicate", "subsystem == \"com.gokoding.Copi\""], timeout: 60).output
+                try? copiLog.write(to: baseDir.appendingPathComponent("copi.log"), atomically: true, encoding: .utf8)
+            }
             log("DONE")
             DispatchQueue.main.async {
                 NSApp.terminate(nil)

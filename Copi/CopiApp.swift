@@ -114,8 +114,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let userInfo = response.notification.request.content.userInfo
+        // 虚拟机、远程桌面不放行（它们会把系统剪贴板同步到客户机上、留在那里）：更新之前发出、还留在通知中心里的通知可能还带着按钮
         if response.actionIdentifier == CopiNotificationAction.useNormalClipboard,
-           let bundleID = userInfo[CopiNotificationAction.bundleIDKey] as? String {
+           let bundleID = userInfo[CopiNotificationAction.bundleIDKey] as? String, !isRemoteDesktopApp(bundleID) {
             let appName = userInfo[CopiNotificationAction.appNameKey] as? String ?? bundleID
             DispatchQueue.main.async {
                 SettingsGuard.userWillAllowNormalClipboard(bundleID)

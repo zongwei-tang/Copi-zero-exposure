@@ -109,9 +109,16 @@ struct PopupView: View {
             if vm.canPaste {
                 PopupItemView(title: "Paste", icon: "lock.shield")
                     .onTapGesture {
+                        // 松开鼠标时调用：那时刚松开过鼠标才算用户亲手点的。从这次松开本身的时刻量：主线程忙时这里会晚到，从现在量
+                        // 会把亲手点的也当成别的程序发来的。正在处理的不是这次松开、或者它已经是 1 秒以前的，就从现在量
+                        let mouseUpAt = NSApp.currentEvent.flatMap { event -> Date? in
+                            let age = ProcessInfo.processInfo.systemUptime - event.timestamp
+                            return event.type == .leftMouseUp && age >= 0 && age <= 1 ? Date(timeIntervalSinceNow: -age) : nil
+                        }
+                        let deliberate = hardwareInput(.leftMouseUp, at: mouseUpAt ?? Date())
                         let target = vm.pasteTarget
                         PopupWindowController.shared.closeWindow()
-                        safePaste(expecting: target)
+                        safePaste(expecting: target, deliberate: deliberate)
                     }
                     .stag(1)
                     .onHover { hover in

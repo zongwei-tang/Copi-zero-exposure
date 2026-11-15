@@ -45,6 +45,8 @@ struct SettingsView: View {
     @State private var systemClipboardTypeSelection: String = ""
     @State private var copiClipboardText: String? = nil
     @State private var copiClipboardConcealed = false
+    // Copi 里存着的不是文字的复制（"An image"、"3 files"）
+    @State private var copiClipboardNonText: String? = nil
     // Copi 剪贴板的内容默认不显示：屏幕共享、录屏、旁边的人都能看到菜单栏面板（macOS 15 起窗口没法把自己排除在屏幕共享之外）
     @State private var revealCopiClipboard = false
     // 系统剪贴板上的内容（放行的 App 里的复制）也一样，点 Show 才显示
@@ -265,14 +267,14 @@ struct SettingsView: View {
                 }
             }
             Toggle("Allow Clipboard Fallback (Less Secure)", isOn: guarded(.allowClipboardFallback, $allowClipboardFallback))
-            Text("Instead of refusing, briefly put the text on the system clipboard (marked private and kept on this Mac) where nothing else works. Other apps can read it during that moment.")
+            Text("Where nothing else works, Copi asks you to press ⌘V or ⌘C again before it uses the system clipboard. With this on it doesn't ask: it briefly puts the text there right away (marked private and kept on this Mac). Other apps can read it during that moment.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("Switch to ABC While Typing", isOn: $switchInputSourceForTyping)
             Text("Where Copi pastes by typing, it briefly switches an input method such as Pinyin to ABC and back, so the input method doesn't change the text.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Toggle("Instant Clipboard Detection (Beta)", isOn: guarded(.instantClipboardDetection, $instantClipboardDetection))
+            Toggle("Instant Clipboard Detection", isOn: guarded(.instantClipboardDetection, $instantClipboardDetection))
             Text("Copi learns the moment another app copies (a password manager's Copy button, a website's copy button) instead of noticing on its next check. It listens for the same internal macOS notice Chrome uses; where that isn't available, it keeps an invisible placeholder on the clipboard. Turn it off if another app behaves oddly with the clipboard.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -293,7 +295,7 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("Type Into Virtual Machines", isOn: guarded(.typeIntoVirtualMachines, $typeIntoVirtualMachines))
-            Text("In virtual machines and remote desktops, paste single lines by pressing the keys. Copi can't see what is running there (in vim or less, letters are commands), so paste only where you would type.")
+            Text("In virtual machines and remote desktops, paste single lines by pressing the keys. Copi can't see what is running there (in vim or less, letters are commands), so paste only where you would type. The guest must use the same keyboard layout as this Mac, or other characters may be typed.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("Clear Copi Clipboard When Mac Locks", isOn: guarded(.clearOnLock, $clearOnLock))
@@ -576,6 +578,18 @@ struct SettingsView: View {
                 } label: {
                     Text("Clear")
                 }
+                // 让附近的设备（iPhone、iPad、另一台 Mac）通过通用剪贴板粘贴这段文字：放上剪贴板一分钟
+                Button {
+                    guard let text = SecureClipboard.shared.text else {
+                        return
+                    }
+                    TransientPaste.shared.shareWithNearbyDevices(text)
+                    notifyCopiNotice("For the next minute, your iPhone, iPad or other Mac can paste this text with Universal Clipboard (Handoff must be on). Apps on this Mac can read it during that minute too.")
+                } label: {
+                    Text("Nearby Devices")
+                }
+                .disabled(copiClipboardText == nil)
+                .help("Let your other Apple devices paste Copi's text for one minute")
             }
         }
         .onDisappear {
@@ -599,7 +613,8 @@ struct SettingsView: View {
 
     private var copiClipboardDisplayText: String {
         guard let text = copiClipboardText else {
-            return "Empty"
+            // 不是文字的复制：只说是什么，粘贴时才放上系统剪贴板
+            return copiClipboardNonText.map { "\($0) (put on the clipboard only while you paste)" } ?? "Empty"
         }
         // 密码管理器的复制永远不显示
         if copiClipboardConcealed {
@@ -722,6 +737,7 @@ struct SettingsView: View {
         }
         copiClipboardText = text
         copiClipboardConcealed = SecureClipboard.shared.isConcealed
+        copiClipboardNonText = NonTextClipboard.shared.summary
     }
 
     func bridgeStatus(_ editor: VSCodeFamilyEditor) -> String {

@@ -91,10 +91,19 @@ struct PasteboardRecheck {
     // 到期后最后再处理的那一次已经安排过了
     var finalPass = false
 }
+// 复查完了还是空的、或者只有图片或标记，Copi 也没有动的那一版（见 lateWriteIsDue）
+struct PasteboardLateWatch {
+    let changeCount: Int
+    // 当时看到的类型
+    let types: Set<String>
+    var lastCheck: Date
+}
 private var kPendingRecheck = 0
 private var kExhaustedRecheck = 0
+private var kLateWatch = 0
 extension NSPasteboard {
-    // 已经复查完（等过 0.5 秒）的那一版：同一版不再开始新的复查（处理它的路上不止一处会要求复查，不能一轮接一轮）
+    // 已经复查完（等过 0.5 秒）的那一版：同一版不再开始新的复查（处理它的路上不止一处会要求复查，不能一轮接一轮）。
+    // 之后又多出了类型的除外（见 lateWriteIsDue）
     fileprivate var exhaustedRecheckChangeCount: Int? {
         get {
             objc_getAssociatedObject(self, &kExhaustedRecheck) as? Int
@@ -113,12 +122,25 @@ extension NSPasteboard {
         }
     }
 
+    fileprivate var lateWatch: PasteboardLateWatch? {
+        get {
+            objc_getAssociatedObject(self, &kLateWatch) as? PasteboardLateWatch
+        }
+        set {
+            objc_setAssociatedObject(self, &kLateWatch, newValue, .OBJC_ASSOCIATION_RETAIN)
+        }
+    }
+
     // 主线程，onNewCopy 钩子里调用：这一版（changeCount）看起来还没写完——只看到标记、只看到非文字的类型（写入方往往先清空，
     // 再分几次写，文字可能最后才写）、或者有文字类型却读不出来（只声明了类型还没写数据）。接下来 0.5 秒里继续看：
     // 类型有了变化（补写进了文字），或者 retryRead 时每 50 毫秒，把它当作新复制重新处理。
-    // 返回 false 表示这一版已经等过 0.5 秒了（调用方按最终结果处理）
+    // 返回 false 表示这一版已经等过 0.5 秒了（调用方按最终结果处理）；只等类型变化的，之后接着慢慢看（见 lateWriteIsDue）
     func recheckUntilComplete(changeCount: Int, retryRead: Bool) -> Bool {
         if exhaustedRecheckChangeCount == changeCount {
+            // 复查完之后又来处理它（最后那次处理走了别的路、开始保护时重新处理……）：还没在慢慢看的，也接着慢慢看
+            if !retryRead, lateWatch?.changeCount != changeCount {
+                lateWatch = PasteboardLateWatch(changeCount: changeCount, types: Set((self.types ?? []).map(\.rawValue)), lastCheck: Date())
+            }
             return false
         }
         let now = Date()
@@ -127,6 +149,9 @@ extension NSPasteboard {
             guard now < recheck.deadline, !recheck.finalPass else {
                 pendingRecheck = nil
                 exhaustedRecheckChangeCount = changeCount
+                if !retryRead {
+                    lateWatch = PasteboardLateWatch(changeCount: changeCount, types: types, lastCheck: now)
+                }
                 return false
             }
             recheck.types = types
@@ -162,6 +187,7 @@ extension NSPasteboard {
             guard recheck.retryRead || types != recheck.types else {
                 pendingRecheck = nil
                 exhaustedRecheckChangeCount = changeCount
+                lateWatch = PasteboardLateWatch(changeCount: changeCount, types: types, lastCheck: now)
                 return false
             }
             recheck.finalPass = true
@@ -181,6 +207,34 @@ extension NSPasteboard {
         }
         recheck.types = types
         pendingRecheck = recheck
+        return true
+    }
+
+    // 别的程序清空剪贴板之后，只有它自己还能往这一版里写，写数据又不改变计数：复查完了还是空的、只有图片或标记，Copi 也没有动的
+    // 那一版，文字可能很晚才写进来。直到计数变了，每 0.1 秒看一次类型（不读数据），多出了类型就重新处理，又可以复查半秒。
+    // 搭平时 20 毫秒的检查，不另开计时器。不在保护时不看（照常处理也不转移）；正在借助系统剪贴板复制时先不看（这次变化会被跳过）
+    fileprivate func lateWriteIsDue(changeCount: Int) -> Bool {
+        guard var watch = lateWatch else {
+            return false
+        }
+        guard watch.changeCount == changeCount else {
+            lateWatch = nil
+            return false
+        }
+        let now = Date()
+        guard now.timeIntervalSince(watch.lastCheck) >= 0.1, GlobalMode.shared.isProtecting, !ClipboardCapture.shared.isActive else {
+            return false
+        }
+        watch.lastCheck = now
+        // 同一版里类型只会增加（偶尔读不到类型时不算变化）
+        let types = Set((types ?? []).map(\.rawValue))
+        guard !types.isSubset(of: watch.types) else {
+            lateWatch = watch
+            return false
+        }
+        // 只看这一次：还是没写完的，由重新处理时的复查接着看
+        lateWatch = nil
+        exhaustedRecheckChangeCount = nil
         return true
     }
 }
@@ -262,6 +316,7 @@ extension NSPasteboard {
         lastCheckedChangeCount = changeCount
         emptyRecheckDeadline = nil
         pendingRecheck = nil
+        lateWatch = nil
         // Copi 自己写剪贴板也会带来一次信号：不算到别人的写入头上
         if self == NSPasteboard.general {
             PasteboardChangeSignal.noteCheck(foreignChange: false)
@@ -321,6 +376,11 @@ extension NSPasteboard {
                 notifyNewCopy(pasteboardItems)
                 return
             }
+            // 复查完之后还慢慢看着的那一版（见 lateWriteIsDue）：补写进了东西就重新处理
+            if isGeneral, lateWriteIsDue(changeCount: changeCount), let pasteboardItems = pasteboard.pasteboardItems {
+                notifyNewCopy(pasteboardItems)
+                return
+            }
             // 别的 App 复制时通常先 clearContents（计数就在这一刻变了）再写数据，而写数据本身不会再改变计数。
             // 如果恰好在两步之间检查，看到的是空剪贴板；之后短时间内再复查几次，免得漏掉这次复制。
             guard let deadline = emptyRecheckDeadline else {
@@ -331,6 +391,9 @@ extension NSPasteboard {
                 // 到期了也最后看一眼：主线程这期间可能一直很忙，没来得及复查，写入方早就写完了
                 if let pasteboardItems = pasteboard.pasteboardItems, !pasteboardItems.isEmpty {
                     notifyNewCopy(pasteboardItems)
+                } else if isGeneral {
+                    // 还是空的：清空它的程序可能更晚才写进来，之后慢慢看着
+                    lateWatch = PasteboardLateWatch(changeCount: changeCount, types: [], lastCheck: Date())
                 }
                 return
             }
@@ -668,9 +731,18 @@ final class TransientPaste: NSObject, NSPasteboardItemDataProvider {
     // 一直没有 App 来读时最多挂这么久（目标 App 很忙时，例如 Electron 渲染进程、Java 事件线程卡住，可能要过一会儿才读）；
     // 期间用户切到别的 App 就提前撤下
     fileprivate let maxLifetime: TimeInterval = 3
+    // 不是文字的复制（见 stageItems）：读文件、图片的 App 一次粘贴往往读好几种类型、分几次读，每读一次都再留这么久；最多挂这么久
+    private let itemsGraceAfterRead: TimeInterval = 1.5
+    private let itemsMaxLifetime: TimeInterval = 5
 
     private(set) var isActive = false
     private var text = ""
+    // 挂着的是不是不是文字的复制，以及每一项的数据（按项的对象认）
+    private var stagesItems = false
+    // 挂着的是用户要给附近的设备粘贴的文字（见 shareWithNearbyDevices）：不只留在本机，读过也不提前撤下
+    private(set) var sharesWithNearbyDevices = false
+    private let nearbyLifetime: TimeInterval = 60
+    private var itemPayloads: [ObjectIdentifier: [NSPasteboard.PasteboardType: Data]] = [:]
     private var stagedType = NSPasteboard.PasteboardType.copiStaged(token: "")
     private var writtenChangeCount = 0
     private var archive: [NSPasteboardItem]?
@@ -682,9 +754,10 @@ final class TransientPaste: NSObject, NSPasteboardItemDataProvider {
     private var activationObserver: NSObjectProtocol?
 
     // 挂着但还没有 App 读过：这时目标 App 可能正卡在读剪贴板上、等我们的主线程提供数据，
-    // 不要再去对它发 Accessibility 请求（它要等我们，我们又在等它）
+    // 不要再去对它发 Accessibility 请求（它要等我们，我们又在等它）。
+    // 给附近的设备的不算：没有哪个 App 在等着粘贴它（读了也不记下来），这一分钟里照常复制，新的复制会把它撤下
     var awaitingRead: Bool {
-        isActive && !hasBeenRead
+        isActive && !hasBeenRead && !sharesWithNearbyDevices
     }
 
     // 我们挂上去的内容是否还在系统剪贴板上（期间没被别的 App 覆盖）。
@@ -707,6 +780,12 @@ final class TransientPaste: NSObject, NSPasteboardItemDataProvider {
         isActive && pid != nil && stagedPID == pid
     }
 
+    // 挂着的是不是为这个 App 挂的这段文字。挂着期间 Copi 剪贴板里可能换成了别的文字（别的程序写进来、被取下来的复制）：
+    // 那就不是"连按粘贴"，要重新判断该怎么粘贴（先试不经过剪贴板的路线）
+    func isStaged(_ text: String, for pid: pid_t?) -> Bool {
+        isStaged(for: pid) && self.text == text
+    }
+
     // restorePrevious：撤下时是否放回原来的剪贴板内容（手动模式需要；Override 模式下原来的内容早已过时，直接清空）。
     // pid：这次粘贴的目标 App（拿着键盘焦点的那个，可能是不激活自身的浮动面板）
     func stage(_ text: String, restorePrevious: Bool, for pid: pid_t?) {
@@ -724,6 +803,9 @@ final class TransientPaste: NSObject, NSPasteboardItemDataProvider {
         let pasteboard = NSPasteboard.general
         archive = restorePrevious ? (previousArchive ?? pasteboard.copiSnapshot()) : nil
         self.text = text
+        stagesItems = false
+        itemPayloads = [:]
+        sharesWithNearbyDevices = false
         stagedType = .copiStaged(token: UUID().uuidString)
         hasBeenRead = false
         stagedAt = Date()
@@ -746,6 +828,93 @@ final class TransientPaste: NSObject, NSPasteboardItemDataProvider {
         pasteboard.markSeen(writtenChangeCount)
         isActive = true
         scheduleFinish(after: maxLifetime)
+    }
+
+    // 用户在菜单里要让附近的设备（iPhone、iPad、另一台 Mac）通过"通用剪贴板"粘贴这段文字：挂上去一分钟，不带"只留在本机"，
+    // 其余和平时一样（按需提供、带剪贴板管理工具不记录的标记、不进 Spotlight 的剪贴板历史）。这期间这台 Mac 上的 App 也读得到
+    func shareWithNearbyDevices(_ text: String) {
+        finish(restoring: false)
+        let pasteboard = NSPasteboard.general
+        archive = nil
+        self.text = text
+        stagesItems = false
+        itemPayloads = [:]
+        sharesWithNearbyDevices = true
+        stagedType = .copiStaged(token: UUID().uuidString)
+        hasBeenRead = false
+        stagedAt = Date()
+        stagedPID = nil
+        let item = NSPasteboardItem()
+        item.setDataProvider(self, forTypes: [.string])
+        for marker in [NSPasteboard.PasteboardType.nspasteboardConcealed, .nspasteboardTransient, .nspasteboardAutoGenerated] {
+            item.setData(Data(), forType: marker)
+        }
+        item.setData(Data(), forType: stagedType)
+        writtenChangeCount = pasteboard.prepareForNewContents(with: [])
+        pasteboard.copiSetPrivateLifetime(until: Date().addingTimeInterval(nearbyLifetime + 2))
+        guard pasteboard.writeObjects([item]) else {
+            sharesWithNearbyDevices = false
+            return
+        }
+        pasteboard.markSeen(writtenChangeCount)
+        isActive = true
+        scheduleFinish(after: nearbyLifetime)
+    }
+
+    // 粘贴 Copi 里不是文字的复制（见 NonTextClipboard）：和文字一样按需提供、带不记录的标记、只留在本机，读走一会儿就撤下。
+    // pid：这次粘贴的目标 App
+    // forFileManager：粘贴进访达这类文件管理器。macOS 27 的访达读了 Copi 放回去的文件却什么都不粘贴，和它照常粘贴的写法
+    // （测试程序在 Copi 关着时试过：按需提供、带标记和 Copi 自己的类型、1.3 秒后撤下）比，只差"只留在本机"和两个私有标记
+    // （到期时间、不进剪贴板历史），所以这时都不加，和那种写法完全一样。访达自己复制这些文件时写的也是不带这些的一份，
+    // 多出来的只是粘贴时这一秒多（Copi 照样在几秒内自己撤下）
+    func stageItems(_ items: [NonTextClipboard.Item], for pid: pid_t?, forFileManager: Bool = false) {
+        finish(restoring: false)
+        let pasteboard = NSPasteboard.general
+        archive = nil
+        text = ""
+        sharesWithNearbyDevices = false
+        stagedType = .copiStaged(token: UUID().uuidString)
+        hasBeenRead = false
+        stagedAt = Date()
+        stagedPID = pid
+        observeActivationIfNeeded()
+
+        var objects: [NSPasteboardItem] = []
+        var payloads: [ObjectIdentifier: [NSPasteboard.PasteboardType: Data]] = [:]
+        for (index, entries) in items.enumerated() {
+            let item = NSPasteboardItem()
+            var payload: [NSPasteboard.PasteboardType: Data] = [:]
+            for entry in entries {
+                payload[entry.type] = entry.data
+            }
+            item.setDataProvider(self, forTypes: entries.map { $0.type })
+            // 标记和 Copi 自己的类型只放在第一项上：读文件列表的 App 不会多看到几项
+            if index == 0 {
+                for marker in [NSPasteboard.PasteboardType.nspasteboardConcealed, .nspasteboardTransient, .nspasteboardAutoGenerated] {
+                    item.setData(Data(), forType: marker)
+                }
+                item.setData(Data(), forType: stagedType)
+            }
+            payloads[ObjectIdentifier(item)] = payload
+            objects.append(item)
+        }
+        guard !objects.isEmpty else {
+            return
+        }
+        stagesItems = true
+        itemPayloads = payloads
+        writtenChangeCount = pasteboard.prepareForNewContents(with: forFileManager ? [] : .currentHostOnly)
+        if !forFileManager {
+            pasteboard.copiSetPrivateLifetime(until: Date().addingTimeInterval(itemsMaxLifetime + 2))
+        }
+        guard pasteboard.writeObjects(objects) else {
+            stagesItems = false
+            itemPayloads = [:]
+            return
+        }
+        pasteboard.markSeen(writtenChangeCount)
+        isActive = true
+        scheduleFinish(after: itemsMaxLifetime)
     }
 
     // 立即撤下（如果还挂着的话）
@@ -772,6 +941,9 @@ final class TransientPaste: NSObject, NSPasteboardItemDataProvider {
         }
         archive = nil
         text = ""
+        stagesItems = false
+        itemPayloads = [:]
+        sharesWithNearbyDevices = false
     }
 
     fileprivate func scheduleFinish(after delay: TimeInterval) {
@@ -795,7 +967,7 @@ final class TransientPaste: NSObject, NSPasteboardItemDataProvider {
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { notification in
             let transientPaste = TransientPaste.shared
-            guard transientPaste.awaitingRead else {
+            guard transientPaste.awaitingRead, !transientPaste.sharesWithNearbyDevices else {
                 return
             }
             let activated = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
@@ -813,13 +985,29 @@ final class TransientPaste: NSObject, NSPasteboardItemDataProvider {
 
     // 有 App 真正读取文本时由系统在主线程回调；同一份数据提供一次之后由剪贴板服务缓存，不会再来问
     func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+        if isActive, stagesItems {
+            guard let data = itemPayloads[ObjectIdentifier(item)]?[type] else {
+                return
+            }
+            item.setData(data, forType: type)
+            hasBeenRead = true
+            scheduleFinish(after: max(itemsGraceAfterRead, minLifetime - Date().timeIntervalSince(stagedAt)))
+            return
+        }
         guard isActive, type == .string else {
             return
         }
         item.setString(text, forType: .string)
+        // 给附近的设备的：一分钟里谁来读都给，不提前撤下、不提示
+        if sharesWithNearbyDevices {
+            return
+        }
         if !hasBeenRead {
             hasBeenRead = true
-            notifyProtected("Pasted safely")
+            // 借助系统剪贴板粘贴的不说"安全"（和 didSafeCopy 里借助剪贴板的复制一样）
+            notifyProtected(ZeroExposurePolicy.isStrict
+                ? "Pasted through the system clipboard as you confirmed, so other apps could read it for a moment"
+                : "Pasted through the system clipboard (Allow Clipboard Fallback is on), so other apps could read it for a moment")
         }
         scheduleFinish(after: max(graceAfterRead, minLifetime - Date().timeIntervalSince(stagedAt)))
     }
@@ -996,6 +1184,9 @@ final class NamedPasteboardScrubber {
     private var isActive = false
     private var lastChangeCount: Int?
     private var recheckUntil: Date?
+    // 这一版是开始之后别的程序写的（不是开始时就有的）：半秒之后也接着看（见 check）
+    private var watchesLate = false
+    private var lastLateCheck = Date.distantPast
     private var pending: DispatchWorkItem?
     private var lastPoll = Date.distantPast
 
@@ -1036,12 +1227,23 @@ final class NamedPasteboardScrubber {
         let pasteboard = NSPasteboard(name: name)
         let changeCount = pasteboard.changeCount
         if changeCount == lastChangeCount {
-            // 刚清空、还没写进文字的那一版（写数据不会再改变计数）：半秒内再看几次
-            guard let until = recheckUntil, Date() < until else {
-                recheckUntil = nil
+            // 刚清空、还没写进文字的那一版（写数据不会再改变计数）：半秒内再看几次。别的程序写的那一版只有它自己还能往里写，
+            // 文字可能更晚才写进来：之后每 0.1 秒看一次类型，直到计数变了
+            guard let until = recheckUntil else {
                 return
             }
+            if Date() >= until {
+                guard watchesLate else {
+                    recheckUntil = nil
+                    return
+                }
+                guard Date().timeIntervalSince(lastLateCheck) >= 0.1 else {
+                    return
+                }
+                lastLateCheck = Date()
+            }
         } else {
+            watchesLate = lastChangeCount != nil
             lastChangeCount = changeCount
             recheckUntil = Date().addingTimeInterval(0.5)
         }

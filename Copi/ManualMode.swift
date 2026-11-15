@@ -28,7 +28,9 @@ class ManualMode {
             guard Defaults[.isOn], !Defaults[.overrideShortcuts] else {
                 return
             }
-            safePaste()
+            // 热键松开时调用：那时键盘上刚松开过一个键才算用户亲手按的。KeyboardShortcuts 不给松开的时刻，只能从这里运行时量：
+            // 主线程忙过 0.25 秒时，亲手按的也不算确认，要再按一次
+            safePaste(deliberate: hardwareInput(.keyUp, at: Date()))
             PopupWindowController.shared.closeWindow()
         }
         // 全局热键一旦注册就会把按键吞掉：Copi 关闭或处于 Override 模式时上面的处理什么也不做，

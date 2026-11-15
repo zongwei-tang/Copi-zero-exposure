@@ -9,7 +9,7 @@ APP="$OUT/CopiSelfTest.app"
 
 mkdir -p "$APP/Contents/MacOS" "$OUT/fakesudo"
 cp "$SRC/Info.plist" "$APP/Contents/Info.plist"
-swiftc -O "$SRC/Sources/main.swift" "$SRC/Sources/extras.swift" -o "$APP/Contents/MacOS/CopiSelfTest"
+swiftc -O "$SRC/Sources/main.swift" "$SRC/Sources/extras.swift" "$SRC/Sources/matrix.swift" -o "$APP/Contents/MacOS/CopiSelfTest"
 swiftc -O "$SRC/Sources/fakesudo.swift" -o "$OUT/fakesudo/sudo"
 codesign --force -s "${SIGN_IDENTITY:--}" "$APP"
 codesign --force -s - "$OUT/fakesudo/sudo"

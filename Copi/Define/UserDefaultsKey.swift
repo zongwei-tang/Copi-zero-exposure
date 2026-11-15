@@ -27,8 +27,9 @@ extension Defaults.Keys {
     static let typeIntoVirtualMachines = Key<Bool>("typeIntoVirtualMachines", default: false)
     // 拖动选中的文字时不让它进拖放剪贴板（不让这次拖动开始）。关掉后照常拖放，放下半秒后清掉
     static let blockTextDragging = Key<Bool>("blockTextDragging", default: true)
-    // 占住系统剪贴板（一个别人认不出的占位项），别的程序一写进来系统就通知 Copi，不用等轮询（实验功能，默认关）
-    static let instantClipboardDetection = Key<Bool>("instantClipboardDetection", default: false)
+    // 别的程序一写系统剪贴板就知道，不用等下一次轮询：收听 macOS 内部的剪贴板变化通知（Chrome 也这样做），收不到时占住系统剪贴板
+    // （一个别人认不出的占位项）。默认开：App 自己写进来的复制（复制按钮、密码管理器）停留的时间更短
+    static let instantClipboardDetection = Key<Bool>("instantClipboardDetection", default: true)
     // 一直每 3 毫秒检查一次系统剪贴板（平时每 20 毫秒，点击、组合键之后半秒内每 4 毫秒）：别的程序自己写进来的复制
     // 停留的时间更短，代价是更费电（默认关）
     static let constantFastCheck = Key<Bool>("constantFastCheck", default: false)

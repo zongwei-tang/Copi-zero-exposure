@@ -29,16 +29,24 @@ class GlobalMode {
         // 返回 true 表示松开时要补发一次 ⌘V / ⌘C，让 App 自己处理。keyTime：按键真正按下的时刻。
         // 热键排在主线程上处理：主线程卡住时它会晚到，这期间用户可能已经按了回车、Tab（焦点换到了别的输入框）。
         // 和 event tap 的路线一样，太晚（超过 1 秒）或者用户已经接着操作了就作废，不补发
-        onPastePress: { keyTime in
-            PastePress.noteDeliberate(at: keyTime)
+        // shift、option：按的是 ⇧⌘V、⌥⇧⌘V
+        // 别的程序合成的按键也会触发热键：键盘上那时刚按下过一个键才算用户亲手按的（见 hardwareInput）
+        onPastePress: { keyTime, shift, option in
+            if hardwareInput(.keyDown, at: keyTime) {
+                PastePress.noteDeliberate(at: keyTime)
+            }
             let isStale = { Date().timeIntervalSince(keyTime) > 1 || userActedSince(keyTime) }
             guard !isStale() else {
                 notifyCopiNotice("Copi was busy and skipped a ⌘V to avoid pasting into the wrong place. Press ⌘V again.")
                 return false
             }
-            return !GlobalMode.shared.handlePaste(chord: .command, isStale: isStale, keyTime: keyTime)
+            let chord: PasteChord = option ? .optionShiftCommand : (shift ? .shiftCommand : .command)
+            return !GlobalMode.shared.handlePaste(chord: chord, isStale: isStale, keyTime: keyTime)
         },
         onCopyPress: { keyTime in
+            if hardwareInput(.keyDown, at: keyTime) {
+                CopyPress.noteDeliberate(at: keyTime)
+            }
             guard Date().timeIntervalSince(keyTime) <= 1, !userActedSince(keyTime) else {
                 GlobalMode.shared.refuseCopy(app: RefusedApp(target: nil), cut: false, reason: .busy)
                 return false
@@ -46,6 +54,9 @@ class GlobalMode {
             return !GlobalMode.shared.handleCopy(cut: false, keyTime: keyTime)
         },
         onCutPress: { keyTime in
+            if hardwareInput(.keyDown, at: keyTime) {
+                CopyPress.noteDeliberate(at: keyTime)
+            }
             guard Date().timeIntervalSince(keyTime) <= 1, !userActedSince(keyTime) else {
                 GlobalMode.shared.refuseCopy(app: RefusedApp(target: nil), cut: true, reason: .busy)
                 return false
@@ -88,6 +99,17 @@ class GlobalMode {
     // 主线程：最近一次当作"不是在复制文字"放行了原生 ⌘C 的地方（"bundleID|AX 角色"）、时间，以及之后剪贴板上的第一版
     //（见 noteNonTextMisjudged）
     private var nonTextPassThrough: (key: String, at: Date, changeCount: Int?)?
+    // 主线程：最近一次交给虚拟机、远程桌面客户机画面的 ⌘C/⌘X（客户机用它自己的剪贴板复制），以及那时安全剪贴板的版本
+    // （它的剪贴板共享随后写进来、被转进 Copi 的那一份也算进去）。之后在同一个 App 的客户机画面里 ⌘V、Copi 里又没有更新的复制时，
+    // 交给客户机用它自己的剪贴板粘贴（见 performPaste）
+    private var guestCopy: GuestCopy?
+    // 主线程：用户确认之后交给 App 自己做的复制（见 CopyThroughAppConsent）：哪个 App、什么时候。随后写进来的文字照常转进 Copi，
+    // 通知说明是怎么回事
+    private var consentedCopyPassedAt: (bundleID: String?, at: Date)?
+    private struct GuestCopy {
+        let pid: pid_t
+        var secureVersion: Int
+    }
     // 正在读哪一版剪贴板的数据（偏好设置里）：读的时候卡死、被看门进程重开后，不要再去读它（见 initialize）
     static let readingPasteboardKey = "readingPasteboardChangeCount"
     // 带 Transient 标记、暂时没有转移的复制：稍后再看一眼，如果一直没被恢复/替换，就当作普通复制转移
@@ -256,12 +278,15 @@ class GlobalMode {
         stateLock.lock()
         let snippet = hasPendingSnippet || quarantinePending
         stateLock.unlock()
-        return snippet || SecureClipboard.shared.hasText
+        return snippet || SecureClipboard.shared.hasText || NonTextClipboard.shared.hasContent
     }
 
-    // 主线程：菜单里点了"粘贴"（PointerInterceptor）。返回 false 时调用方替 App 按一次快捷键，粘贴系统剪贴板上的内容
-    func handleMenuPaste(shift: Bool, option: Bool, keyTime: Date) -> Bool {
-        PastePress.noteDeliberate(at: keyTime)
+    // 主线程：菜单里点了"粘贴"（PointerInterceptor）。返回 false 时调用方替 App 按一次快捷键，粘贴系统剪贴板上的内容。
+    // deliberate：是用户亲手点的、按的回车（见 hardwareInput）
+    func handleMenuPaste(shift: Bool, option: Bool, keyTime: Date, deliberate: Bool) -> Bool {
+        if deliberate {
+            PastePress.noteDeliberate(at: keyTime)
+        }
         let chord: PasteChord = option ? .optionShiftCommand : (shift ? .shiftCommand : .command)
         return handlePaste(chord: chord, isStale: { userActedSince(keyTime) }, keyTime: keyTime)
     }
@@ -286,6 +311,13 @@ class GlobalMode {
         return nativePastePassedAt.map { Date().timeIntervalSince($0) < 0.5 } ?? false
     }
 
+    // 任意线程：从 date 起放行过原生 ⌘V（例如读一份很大的复制的那几秒里）
+    private func nativePastePassed(since date: Date) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return nativePastePassedAt.map { $0 >= date } ?? false
+    }
+
     // 任意线程（PasteboardWatcher 在后台线程上问）：主线程忙的时候，后台线程可不可以替它把系统剪贴板上新出现的文字取下来。
     // 只在照常处理也一定会转移走的情况下：正在保护、没有刚放行的原生粘贴/剪切（App 可能正要读、或者内容带着刚剪掉的图片）、
     // 拿着焦点的不是放行的 App（它自己的复制要留在系统剪贴板上）。内容本身（文件、通用剪贴板、临时内容……）由后台线程看
@@ -296,7 +328,7 @@ class GlobalMode {
         return !ZeroExposurePolicy.usesNormalClipboard(focusedApplication()?.bundleIdentifier)
     }
 
-    // 主线程（PasteboardQuarantine）：要取下一份复制了。刚放行了原生 ⌘V（App 可能正在读）就不取；否则从现在起 ⌘V 交给 Copi。
+    // 主线程（PasteboardQuarantine、captureNonText）：要取下一份复制了。刚放行了原生 ⌘V（App 可能正在读）就不取；否则从现在起 ⌘V 交给 Copi。
     // 判断和登记一起做（event tap 线程同时在看这两个状态）
     func beginQuarantine() -> Bool {
         stateLock.lock()
@@ -855,14 +887,21 @@ class GlobalMode {
             return
         }
         if types.contains(.fileURL) || (!hasMeaningfulText && !types.isSubset(of: plainTextTypes)) {
-            // Finder 里复制的文件、只有图片之类不是文字的内容：留在系统剪贴板上照常原生粘贴（之前会被清掉，
-            // 等于把用户的复制弄丢了）。它比安全剪贴板里的内容更新，旧的作废。
-            // 写入方可能还没写完（先写了图片、来源标记，文字最后才写）：半秒内类型有了变化就重新处理
+            // Finder 里复制的文件、只有图片之类不是文字的内容：它比安全剪贴板里的内容更新，旧的作废。
+            // 写入方可能还没写完（先写了图片、来源标记，文字最后才写）：半秒内类型有了变化就重新处理。
+            // 写完之后整个取下来存进 Copi、从系统剪贴板上清掉，粘贴时才短暂放上去（见 captureNonText）
             if !types.contains(.fileURL) {
                 _ = pasteboard.recheckUntilComplete(changeCount: changeCount, retryRead: false)
             }
             safeCopyIsNewest = false
             SecureClipboard.shared.setText(nil)
+            // 挂着的粘贴内容（给附近的设备的一分钟、读后还留着的文件）已经被这份取代：只是复位，否则 captureNonText 以为还挂着，就不取了
+            TransientPaste.shared.finish()
+            // 客户机里刚复制、它的剪贴板共享写过来的图片、文件：和文字一样（见下面），在客户机里粘贴照样交给客户机
+            if let guest = guestCopy, focusedApplication()?.processIdentifier == guest.pid {
+                guestCopy?.secureVersion = SecureClipboard.shared.version
+            }
+            scheduleNonTextCapture(changeCount: changeCount)
             return
         }
         // 刚把一次原生 ⌘V 放行给 App（当时安全剪贴板是空的），App 可能还没读完剪贴板：
@@ -897,6 +936,10 @@ class GlobalMode {
             || ZeroExposurePolicy.isPasswordManager(declaredSource)
         SecureClipboard.shared.setText(plainText, concealed: types.contains(.nspasteboardConcealed) || fromPasswordManager,
                                        source: declaredSource ?? focusedApplication()?.bundleIdentifier)
+        // 客户机里刚复制、它的剪贴板共享写到这台 Mac 上的那一份：客户机自己的剪贴板上也是它，在客户机里粘贴照样交给客户机
+        if let guest = guestCopy, focusedApplication()?.processIdentifier == guest.pid {
+            guestCopy?.secureVersion = SecureClipboard.shared.version
+        }
         safeCopyIsNewest = true
         lastSafeCopyAt = nil
         if droppedAttachments {
@@ -908,6 +951,11 @@ class GlobalMode {
             // 放行的 App 在前台时别的程序写进来的内容（pbcopy、密码管理器、同步工具）
             let name = focused.localizedName ?? "the app in front"
             notifyCopiNotice("Something put text on the system clipboard while \(name) was in front, but not with ⌘C, ⌘X or a click in \(name), so Copi moved it. Only \(name)'s own copies stay on the clipboard.")
+        } else if let consented = consentedCopyPassedAt, Date().timeIntervalSince(consented.at) < 2,
+                  consented.bundleID == nil || consented.bundleID == focusedApplication()?.bundleIdentifier {
+            // 用户确认之后交给 App 自己做的复制
+            consentedCopyPassedAt = nil
+            notifyCopiNotice("Copied. The text was on the system clipboard for a moment before Copi moved it in.")
         } else if noteNonTextMisjudged(passThrough, types: types, declaredSource: declaredSource) {
             // 刚把这次 ⌘C 当作复制文件、图片放行了，结果是文字：以后在这里拒绝（noteNonTextMisjudged 已经告诉用户）
         } else if ZeroExposurePolicy.isStrict {
@@ -1059,6 +1107,13 @@ class GlobalMode {
 
     // MARK: - ⌘C / ⌘V 拦截
 
+    // event tap 线程：硬件层刚（0.25 秒内）记下过一次按键，刚收到的这个按键多半是用户亲手按的（和 hardwareInput 一样）。
+    // 只是推测，不看这个事件本身是谁发的：别的程序紧跟在用户自己的按键之后合成的、或者经硬件层（HID）发来的按键也会被当成亲手按的
+    //（键位重映射工具、宏工具、Copi 自己的自测程序都这样发）
+    private static func pressedOnKeyboard() -> Bool {
+        CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown) < 0.25
+    }
+
     // 运行在 event tap 线程上，只负责识别按键；真正的处理在主线程完成
     private func shouldSwallow(_ event: CGEvent) -> Bool {
         stateLock.lock()
@@ -1093,10 +1148,11 @@ class GlobalMode {
             }
             return false
         }
-        // Copi 正在模拟键入时按下的回车：先不给 App（打了一半的消息、命令会被发出去、执行），键入停下（见 TypingInterrupt）
+        // Copi 正在模拟键入时按下的键：先不给 App（回车会把打了一半的消息、命令发出去、执行，别的键会夹进打到一半的文字里），
+        // 键入停下；Esc 就是让它停下（见 TypingInterrupt）
         if event.type == .keyDown, event.getIntegerValueField(.eventSourceUserData) != copiSyntheticEventMarker,
-           [Int64(kVK_Return), Int64(kVK_ANSI_KeypadEnter)].contains(event.getIntegerValueField(.keyboardEventKeycode)),
-           TypingInterrupt.swallowReturn(isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0) {
+           TypingInterrupt.swallowKey(event.getIntegerValueField(.keyboardEventKeycode),
+                                      isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0) {
             return true
         }
         // 菜单开着时按回车选了"拷贝/剪切/粘贴"（见 PointerInterceptor.interceptMenuKey）
@@ -1109,6 +1165,10 @@ class GlobalMode {
         if flags.check(is: .maskCommand) {
             let isCopy = event.isLetter("c", ansiKeyCode: kVK_ANSI_C)
             if isCopy || event.isLetter("x", ansiKeyCode: kVK_ANSI_X) {
+                // 按住不放的自动重复、硬件层刚才没记下按键时别的程序合成的按键不算用户亲手再复制一次（见 CopyThroughAppConsent、pressedOnKeyboard）
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0, Self.pressedOnKeyboard() {
+                    CopyPress.noteDeliberate(at: keyTime)
+                }
                 // 等不到主线程就先吞掉 ⌘C/⌘X（之后由主线程决定是复制、拒绝还是原样补发），不能直接放行给 App——那样文字就以普通复制的
                 // 身份（没有不记录的标记、会经通用剪贴板同步）进了系统剪贴板；允许剪贴板回退时也一样
                 // ⌘X 一律先吞掉：等不到主线程时如果放行，App 自己剪切一次，主线程稍后又删一次选区
@@ -1145,6 +1205,25 @@ class GlobalMode {
         } else {
             InputActivity.noteInput()
             noteShortcutKey(event)
+            // ⌥⌘V：文件管理器的"移动到这里"自己读剪贴板上的文件。Copi 里存着不是文字的复制、或者正在把一份复制取下来时交给主线程看一眼
+            // （见 handleMoveItemHere；取下来的那一下占着主线程，它排在后面，看到的是存进 Copi 的那一份），等不到就照常放行
+            // （别的 App 里它是"粘贴样式"之类，不能因为 Copi 忙就吞掉）。
+            // 和 ⌘V 一样，判断和记下"放行了一次原生 ⌥⌘V"一起做：访达复制的文件还没取下来时，它读的是系统剪贴板上的那一份，
+            // captureNonText 要等它读完再清（见 beginQuarantine）
+            if flags.check(is: [.maskCommand, .maskAlternate]), event.isLetter("v", ansiKeyCode: kVK_ANSI_V) {
+                stateLock.lock()
+                let route = NonTextClipboard.shared.hasContent || quarantinePending
+                if !route, !SecureClipboard.shared.hasText, !hasPendingSnippet {
+                    nativePastePassedAt = Date()
+                }
+                stateLock.unlock()
+                if route {
+                    let deliberate = event.getIntegerValueField(.keyboardEventAutorepeat) == 0 && Self.pressedOnKeyboard()
+                    return decideOnMainThread(event, timeout: decisionTimeout, swallowOnTimeout: false) { isStale in
+                        GlobalMode.shared.handleMoveItemHere(keyTime: keyTime, deliberate: deliberate, isStale: isStale)
+                    }
+                }
+            }
             return false
         }
         guard event.isLetter("v", ansiKeyCode: kVK_ANSI_V) else {
@@ -1156,7 +1235,8 @@ class GlobalMode {
         // 安全剪贴板是空的（也没有刚撤下来的临时文字）就没什么要做的，直接放行，不去打扰主线程。
         // 判断和记下"放行了一次原生 ⌘V"要一起做（主线程同时可能正要把一段临时文字撤下来）
         stateLock.lock()
-        let route = SecureClipboard.shared.hasText || hasPendingSnippet || quarantinePending || copyDecisionsPending > 0
+        let route = SecureClipboard.shared.hasText || NonTextClipboard.shared.hasContent || hasPendingSnippet || quarantinePending
+            || copyDecisionsPending > 0
         if !route {
             nativePastePassedAt = Date()
         }
@@ -1166,8 +1246,8 @@ class GlobalMode {
             noteShortcutKey(event)
             return false
         }
-        // 按住 ⌘V 不放的自动重复不算用户亲手再粘贴一次（见 PasteConfirmation）
-        if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+        // 按住 ⌘V 不放的自动重复、硬件层刚才没记下按键时别的程序合成的按键不算用户亲手再粘贴一次（见 PasteConfirmation、pressedOnKeyboard）
+        if event.getIntegerValueField(.keyboardEventAutorepeat) == 0, Self.pressedOnKeyboard() {
             PastePress.noteDeliberate(at: keyTime)
         }
         return decideOnMainThread(event, timeout: decisionTimeout, swallowOnTimeout: true, onDropped: {
@@ -1231,7 +1311,8 @@ class GlobalMode {
 
     // 拒绝了一次复制：安全剪贴板里更早的内容也作废——用户以为刚才复制成功了，接下来的 ⌘V 不能把更早的（可能是机密的）内容插进去。
     // 为放行的 App 临时挂在系统剪贴板上的内容也撤下
-    func refuseCopy(app: RefusedApp, cut: Bool, reason: CopyRefusal = .unreadable) {
+    // offerApp：通知里说明再复制一次就交给 App 自己复制（见 CopyThroughAppConsent）
+    func refuseCopy(app: RefusedApp, cut: Bool, reason: CopyRefusal = .unreadable, offerApp: Bool = false) {
         TransientPaste.shared.finish()
         pendingSnippet = nil
         SecureClipboard.shared.setText(nil)
@@ -1245,7 +1326,7 @@ class GlobalMode {
             PasteboardQuarantine.shared.discardQueued()
             pasteboard.markSeen(pasteboard.copiClear())
         }
-        notifyCopyRefused(app: app, cut: cut, reason: reason)
+        notifyCopyRefused(app: app, cut: cut, reason: reason, offerApp: offerApp)
     }
 
     // 返回 true 表示吞掉原始的 ⌘C/⌘X。cut：⌘X——读出选中的文字存进安全剪贴板，再按一次退格把它删掉
@@ -1308,6 +1389,10 @@ class GlobalMode {
                 }
                 return CopyAttempt(text: nil, target: target, passThrough: !strict, multipleSelections: true)
             }
+            // Firefox 看不出选了几段：用 ⌘ 添过选区的地方拒绝。允许剪贴板回退时也不交给它（可能只是 ⌘点了一下，本来读得出来）
+            if target.mayHaveUnlistedSelections {
+                return CopyAttempt(text: nil, target: target, multipleSelections: true)
+            }
             // JetBrains：IDE 卡住时读选区会在 1 秒后得到空字符串而不是报错，不能当成"没选中"；没选中时和 IDE 自己的复制一样复制整行
             if target.isJavaIDE {
                 let attempt = jetBrainsCopyAttempt(target, cut: cut)
@@ -1320,11 +1405,13 @@ class GlobalMode {
             if cut {
                 // ⌘X 只在能删掉选中内容的可编辑控件里按退格（看不出有几段选区的 IDE 除外）
                 let editable = target.isEditableTextControl && !target.isJavaIDE
-                if !editable, !strict {
-                    return CopyAttempt(text: nil, target: target, passThrough: true)
-                }
                 // 选区里有图片：只复制了文字，不删（退格会把图片也删掉）
                 let copied = zeroExposureCopySelection(from: target)
+                // 不可编辑的地方读不出来、又允许剪贴板回退：交给 App 自己剪切（之后从系统剪贴板转移走）。读得出来时照样只复制、不删：
+                // App 自己的剪切在不可编辑的地方往往什么都不做（例如 Safari 的网页正文），交给它用户就什么都没复制上
+                if copied == nil, !editable, !strict {
+                    return CopyAttempt(text: nil, target: target, passThrough: true)
+                }
                 return CopyAttempt(text: copied?.text, target: target, deletable: editable && copied?.droppedAttachments != true,
                                    droppedAttachments: copied?.droppedAttachments ?? false)
             }
@@ -1335,6 +1422,12 @@ class GlobalMode {
             // 编辑器自己的复制这时也什么都不做（没有选中内容、并且关掉了"空选区复制整行"）
             if attempt.editorCopiedNothing {
                 return true
+            }
+            // 虚拟机、远程桌面的客户机画面：Copi 读不到里面选中的东西，交给客户机用它自己的剪贴板复制（和在客户机里按 Ctrl+C 一样）。
+            // 它把剪贴板共享给这台 Mac 时，文字写到系统剪贴板上，照常在几毫秒内转进 Copi
+            if let app = focusedApplication(), isRemoteDesktopGuestDisplay(attempt.target, bundleID: app.bundleIdentifier) {
+                guestCopy = GuestCopy(pid: app.processIdentifier, secureVersion: SecureClipboard.shared.version)
+                return passCopyThrough(pasteboard, cut: cut)
             }
             if attempt.busy {
                 guard strict else {
@@ -1354,8 +1447,17 @@ class GlobalMode {
                 return passCopyThrough(pasteboard, cut: cut)
             }
             if attempt.multipleSelections {
-                refuseCopy(app: RefusedApp(target: attempt.target), cut: cut, reason: .multipleSelections)
-                return true
+                // 再复制一次就交给 App 自己复制：它自己的复制会带上每一段
+                guard CopyThroughAppConsent.isAvailable(cut: cut) else {
+                    refuseCopy(app: RefusedApp(target: attempt.target), cut: cut, reason: .multipleSelections)
+                    return true
+                }
+                if CopyThroughAppConsent.needsConfirmation(pid: attempt.target?.pid, element: attempt.target?.element, cut: cut, keyTime: keyTime) {
+                    refuseCopy(app: RefusedApp(target: attempt.target), cut: cut, reason: .multipleSelections, offerApp: true)
+                    return true
+                }
+                consentedCopyPassedAt = (attempt.target?.bundleIdentifier, Date())
+                return passCopyThrough(pasteboard, cut: cut)
             }
             // 默认（不回退剪贴板）：除非确定不是在复制文字（文件、图片），否则没有不经过系统剪贴板的办法就拒绝——
             // 包括 Accessibility 读不出来、判断不了的情况
@@ -1375,8 +1477,21 @@ class GlobalMode {
                 if isSecure {
                     return true
                 }
-                refuseCopy(app: RefusedApp(target: target), cut: cut, reason: hasSelection == false ? .emptySelection : .unreadable)
-                return true
+                // 读不出来（或者看不到选中的文字：有的编辑器这时复制整行，密码管理器复制选中条目的密码）：第一次说明为什么，
+                // 8 秒内在同一个地方再复制一次就交给 App 自己复制（文字在系统剪贴板上停几毫秒，随后转进 Copi）。不能复制就等于什么都做不了
+                let reason: CopyRefusal = hasSelection == false ? .emptySelection : .unreadable
+                // 读不到焦点控件时退回系统报告的焦点 App：确认只算在通知里点名的这个 App 里，换到别的 App 再按一次不算
+                let app = RefusedApp(target: target)
+                guard CopyThroughAppConsent.isAvailable(cut: cut) else {
+                    refuseCopy(app: app, cut: cut, reason: reason)
+                    return true
+                }
+                if CopyThroughAppConsent.needsConfirmation(pid: app.pid, element: target?.element, cut: cut, keyTime: keyTime) {
+                    refuseCopy(app: app, cut: cut, reason: reason, offerApp: true)
+                    return true
+                }
+                consentedCopyPassedAt = (app.bundleID, Date())
+                return passCopyThrough(pasteboard, cut: cut)
             }
             return passCopyThrough(pasteboard, cut: cut)
         }
@@ -1524,6 +1639,217 @@ class GlobalMode {
 
     // 放行真正的 ⌘C/⌘X：App 写进系统剪贴板后由 handleSystemPasteboardChange 转移到安全剪贴板（用户放行的 App 除外），
     // 这段时间加密检查。这次复制要立即转移，不受刚放行过原生 ⌘V 的推迟影响。
+    // MARK: - 不是文字的复制
+
+    // 主线程：系统剪贴板上是不是文字的复制（图片、文件……）。等它写完再整个取下来存进 Copi：刚放行给访达、图片的 ⌘C，App 在处理这次
+    // 按键时就写完了；别的程序写进来的可能分几次写（先写图片、过一会儿才补上文字，见 lateWriteIsDue），清掉之后它就补不上了，多等一会儿
+    private func scheduleNonTextCapture(changeCount: Int) {
+        let quick = nonTextPassThrough.map { Date().timeIntervalSince($0.at) < 1 } ?? false
+        DispatchQueue.main.asyncAfter(deadline: .now() + (quick ? 0.5 : 3.5)) { [weak self] in
+            self?.captureNonText(changeCount: changeCount)
+        }
+    }
+
+    // 主线程：取下来存进 Copi、从系统剪贴板上清掉。期间剪贴板换了内容、保护停了、读不全（见 copiNonTextSnapshot）就照旧留着
+    private func captureNonText(changeCount: Int) {
+        let pasteboard = NSPasteboard.general
+        guard Defaults[.isOn], Defaults[.overrideShortcuts], isProtecting, pasteboard.changeCount == changeCount else {
+            return
+        }
+        // 锁着屏、切到了别的用户、登录窗口在前台：这时不读，回来之后再取。这一份已经记为检查过，不会再被当成新的复制，
+        // 这里放弃的话它就一直以普通复制的形式（没有标记、不只留在本机）留在系统剪贴板上。有了新的复制、保护停了，上面就不再重试
+        if sessionIsLockedNow() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.captureNonText(changeCount: changeCount)
+            }
+            return
+        }
+        guard !TransientPaste.shared.isActive, !ClipboardCapture.shared.isActive,
+              !SecureClipboard.shared.hasText, leftForNormalClipboardApp?.changeCount != changeCount,
+              SystemClipboardFeatures.cachedPasteboardAccess == .allowed,
+              let items = pasteboard.pasteboardItems, !items.isEmpty else {
+            return
+        }
+        // 这期间补上了文字（还没被转走）：交给文字的处理，不当作图片、文件存。和 handleSystemPasteboardChange 一样只看第一份文字、
+        // 不算附件占位符（U+FFFC，例如只选中了文档里的一张图片）：两边判断不一致的话，它就一直留在系统剪贴板上
+        let types = Set(items.flatMap { $0.types })
+        let text = items.lazy.compactMap { $0.string(forType: .string) }.first ?? ""
+        if !types.contains(.fileURL),
+           !text.replacingOccurrences(of: "\u{FFFC}", with: "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pasteboard.forgetLastCheckedChangeCount()
+            return
+        }
+        // 刚放行了原生 ⌘V（那时 Copi 里还没有它），App 可能正在读：不清，过半秒整个再来一遍
+        func retryLater() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.captureNonText(changeCount: changeCount)
+            }
+        }
+        // 在看之前记下时刻：这之前的 ⌘V 下面马上看，之后的（读的那几秒里的）读完再看，中间不漏
+        let checkedAt = Date()
+        if nativePasteJustPassed {
+            retryLater()
+            return
+        }
+        // 源 App 当场生成一张大图可能要一会儿：这期间请看门进程别把 Copi 当成卡死
+        UserDefaults.standard.set(changeCount, forKey: Self.readingPasteboardKey)
+        CrashWatchdog.pauseHangCheck()
+        let snapshot = pasteboard.copiNonTextSnapshot(items)
+        CrashWatchdog.resumeHangCheck()
+        UserDefaults.standard.removeObject(forKey: Self.readingPasteboardKey)
+        guard let snapshot, pasteboard.changeCount == changeCount else {
+            return
+        }
+        // 读的时候放行了原生 ⌘V：App 可能也在等这一份、还没读完（读一张大图可能要好几秒，beginQuarantine 只看最近半秒），过半秒再来
+        if nativePastePassed(since: checkedAt) {
+            retryLater()
+            return
+        }
+        // 从这里到清掉之前的 ⌘V：判断和"从现在起 ⌘V 交给 Copi"一起做（见 beginQuarantine），之后的 ⌘V 等这里做完，粘贴存进 Copi 的这一份
+        guard beginQuarantine() else {
+            retryLater()
+            return
+        }
+        defer {
+            endQuarantine()
+        }
+        // 登记时（注册热键要和窗口服务器通信）又有了新的复制：这次不取
+        guard pasteboard.changeCount == changeCount else {
+            return
+        }
+        // 客户机的剪贴板共享写过来的（见 handleSystemPasteboardChange）：存进 Copi 之后照样算客户机自己的复制
+        let fromGuest = guestCopy?.secureVersion == SecureClipboard.shared.version
+        NonTextClipboard.shared.store(snapshot, summary: Self.nonTextSummary(items))
+        if fromGuest {
+            guestCopy?.secureVersion = SecureClipboard.shared.version
+        }
+        pasteboard.markSeen(pasteboard.copiClear())
+    }
+
+    // 菜单里显示的说明
+    private static func nonTextSummary(_ items: [NSPasteboardItem]) -> String {
+        let files = items.filter { $0.types.contains(.fileURL) }.count
+        if files > 0 {
+            return files == 1 ? "A file" : "\(files) files"
+        }
+        let images = items.filter { item in item.types.contains { NSImage.imageTypes.contains($0.rawValue) } }.count
+        if images == items.count {
+            return images == 1 ? "An image" : "\(images) images"
+        }
+        return "Something that isn't text"
+    }
+
+    // 主线程：替 App 自己读剪贴板的命令（"从剪贴板新建"）把 Copi 里不是文字的复制放回剪贴板，和粘贴时一样短暂、带标记。
+    // time：用户选这一项的时刻；deliberate：是用户亲手选的（见 PointerInterceptor.perform）。返回 false 表示这次只提醒、没有放回去，
+    // 不要替用户按下这一项
+    func stageNonTextForApp(pid: pid_t, time: Date, deliberate: Bool) -> Bool {
+        guard let items = NonTextClipboard.shared.items, !SecureClipboard.shared.hasText,
+              !systemPasteboardHasContent(NSPasteboard.general) else {
+            return true
+        }
+        // 和 ⌘V 粘贴它时一样（见 pasteNonText）：有会把本机剪贴板同步出去的 App 在运行时先提醒，8 秒内再选一次这一项（或按 ⌘V）才放上去
+        if deliberate {
+            PastePress.noteDeliberate(at: time)
+        }
+        if let reason = remoteClipboardConfirmationBeforeFallback("\u{0}non-text \(NonTextClipboard.shared.version)", targetPID: pid, keyTime: time) {
+            notifyPasteRefused(reason, app: RefusedApp(target: nil))
+            return false
+        }
+        TransientPaste.shared.stageItems(Self.itemsForPaste(items, into: pid), for: pid, forFileManager: Self.isFileManager(pid))
+        return true
+    }
+
+    // 主线程：粘贴 Copi 里不是文字的复制。没有不经过剪贴板的办法：按需提供、带不记录的标记、只留在本机，App 读走一会儿就撤下，
+    // 然后放行这次 ⌘V。返回 true 表示吞掉这次按键
+    private func pasteNonText(chord: PasteChord, isStale: () -> Bool, keyTime: Date) -> Bool {
+        guard let items = NonTextClipboard.shared.items else {
+            return false
+        }
+        let focused = focusedApplication()
+        if chord != .command, let focused, !shiftPasteIsPaste(in: focused, option: chord == .optionShiftCommand, wait: true) {
+            return false
+        }
+        if isStale() {
+            return true
+        }
+        // 有会把本机剪贴板同步出去的 App 在运行：先提醒
+        if let reason = remoteClipboardConfirmationBeforeFallback("\u{0}non-text \(NonTextClipboard.shared.version)",
+                                                                  targetPID: focused?.processIdentifier, keyTime: keyTime) {
+            notifyPasteRefused(reason, app: RefusedApp(target: nil))
+            return true
+        }
+        TransientPaste.shared.stageItems(Self.itemsForPaste(items, into: focused?.processIdentifier), for: focused?.processIdentifier,
+                                         forFileManager: Self.isFileManager(focused?.processIdentifier))
+        return false
+    }
+
+    // 粘贴进访达这类文件管理器时只放回文件地址：原样放回访达复制时的全部类型（它自己的内部类型、图标），却缺了它只给自己写的
+    // 那两种（com.apple.finder.noderef、fndf）时，macOS 27 的访达认为这不是一份完整的复制，什么都不粘贴。只有文件地址它照常粘贴。
+    // 别的 App 照旧拿到完整的一份
+    static func isFileManager(_ pid: pid_t?) -> Bool {
+        guard let pid, let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else {
+            return false
+        }
+        return fileManagerBundleIDs.contains(bundleID)
+    }
+
+    static func itemsForPaste(_ items: [NonTextClipboard.Item], into pid: pid_t?) -> [NonTextClipboard.Item] {
+        guard isFileManager(pid) else {
+            return items
+        }
+        // 访达自己复制时写的是文件引用地址（路径是 /.file/id=…），只有它结合自己那两种内部类型才认得：换成普通的路径地址
+        let files = items.map { item in
+            item.filter { $0.type == .fileURL }.map { entry -> (type: NSPasteboard.PasteboardType, data: Data) in
+                guard let string = String(data: entry.data, encoding: .utf8), let url = URL(string: string),
+                      let path = (url as NSURL).filePathURL, let data = path.absoluteString.data(using: .utf8) else {
+                    return entry
+                }
+                return (entry.type, data)
+            }
+        }
+        return files.allSatisfy({ !$0.isEmpty }) ? files : items
+    }
+
+    // 主线程：⌥⌘V。文件管理器（访达、ForkLift……）里它是"移动到这里"，自己去读剪贴板上的文件：Copi 里存着复制的文件、系统剪贴板空着时，
+    // 和 ⌘V 一样先短暂放回去（见 pasteNonText），再放行这次按键，由它把文件移过来。别的 App 里 ⌥⌘V 是"粘贴样式"之类，照常交给 App。
+    // keyTime：按下的时刻；deliberate：是亲手按的（再按一次确认提醒时才算数，见 PasteConfirmation）。返回 true 表示吞掉这次按键
+    private func handleMoveItemHere(keyTime: Date, deliberate: Bool, isStale: () -> Bool) -> Bool {
+        guard isOverrideActive, !sessionIsLockedNow(), let focused = focusedApplication(), focused.processIdentifier != getpid(),
+              let bundleID = focused.bundleIdentifier, fileManagerBundleIDs.contains(bundleID) else {
+            return false
+        }
+        if deliberate {
+            PastePress.noteDeliberate(at: keyTime)
+        }
+        // 先处理还没轮询到的剪贴板变化（和 planPaste 一样）：系统剪贴板上有更新的内容就照常让它读那个
+        let pasteboard = NSPasteboard.general
+        pasteboard.checkForChangesInPasteboard()
+        guard NonTextClipboard.shared.hasContent, !SecureClipboard.shared.hasText, !systemPasteboardHasContent(pasteboard) else {
+            return false
+        }
+        return pasteNonText(chord: .command, isStale: isStale, keyTime: keyTime)
+    }
+
+    // 主线程：手动模式的 Safe Paste，Copi 里存着的是不是文字的复制（关掉 Override 之前收进来的图片、文件）：手动模式下只有这里粘贴得出来，
+    // 和文字一样。和 Override 模式的 ⌘V 一样先短暂放回剪贴板（见 pasteNonText），再替用户按一次 ⌘V。系统剪贴板上有更新的内容时什么都不做
+    // （上一次粘贴挂上去、还没撤下的那一份不算：贴进第二个地方、点对了位置再按，照样重新挂上去、再按一次 ⌘V）
+    // keyTime：按下 Safe Paste 的时刻（再按一次确认提醒时用，见 PasteConfirmation）
+    func safePasteNonText(keyTime: Date) {
+        guard !SecureClipboard.shared.hasText, NonTextClipboard.shared.hasContent,
+              TransientPaste.shared.isOnPasteboard || !systemPasteboardHasContent(NSPasteboard.general) else {
+            return
+        }
+        // pasteNonText 返回 true：有会把本机剪贴板同步出去的 App 在运行，这次只提醒、没有放回去
+        if !pasteNonText(chord: .command, isStale: { false }, keyTime: keyTime) {
+            postPasteKeystroke()
+        }
+    }
+
+    // 主线程：退回剪贴板方式、挂上要粘贴的内容之后，替用户按一次 ⌘V。Secure Input 期间不能让 Copi 自己的 ⌘V 热键接住它（见 SecureInputHotKeys.postPaste）
+    func postFallbackPaste() {
+        secureInputHotKeys.postPaste()
+    }
+
     private func passCopyThrough(_ pasteboard: NSPasteboard, cut: Bool = false) -> Bool {
         stateLock.lock()
         nativeCutPassedAt = cut ? Date() : nil
@@ -1540,6 +1866,8 @@ class GlobalMode {
         case native
         // 粘贴这段安全剪贴板里的文本。concealed：刚写进来、还没收进安全剪贴板的临时文字是不是机密（nil：看安全剪贴板）
         case secureText(String, concealed: Bool? = nil)
+        // 粘贴 Copi 里不是文字的复制（图片、文件……，见 NonTextClipboard）
+        case nonText
     }
 
     // 用 ⇧⌘V 呼出历史的剪贴板管理工具在运行
@@ -1580,6 +1908,10 @@ class GlobalMode {
             }
         }
         guard let text = SecureClipboard.shared.text else {
+            // Copi 里是不是文字的复制，系统剪贴板上又没有更新的东西：粘贴它
+            if NonTextClipboard.shared.hasContent, !systemPasteboardHasContent(pasteboard) {
+                return .nonText
+            }
             return .native
         }
         if TransientPaste.shared.isOnPasteboard {
@@ -1598,6 +1930,28 @@ class GlobalMode {
     private let shiftPasteIsNotPasteBundleIDPrefixes = [
         "com.jetbrains.", "com.google.android.studio", "com.apple.Terminal", "com.microsoft.VSCode", "com.vscodium",
     ]
+
+    // 主线程：⇧⌘V（option：⌥⇧⌘V）在这个 App 里要不要由 Copi 接管。App 自己的菜单栏把它当作"粘贴"时接管；不是的话交给 App
+    // （别的程序的快捷键、剪贴板管理工具呼出历史），只有浏览器里的 ⇧⌘V（网页里的"无格式粘贴"）在没有用 ⇧⌘V 呼出历史的
+    // 剪贴板管理工具在运行时也接管。还没读到它的菜单栏时：wait 为 true 读一下、最多等 80 毫秒；为 false 只开始读，这次当作不接管
+    // （按键拦截和 Secure Input 期间的热键用的是同一条规则）
+    func shiftPasteIsPaste(in app: NSRunningApplication, option: Bool, wait: Bool) -> Bool {
+        let bundleID = app.bundleIdentifier ?? ""
+        if !option, shiftPasteIsNotPasteBundleIDPrefixes.contains(where: { bundleID.hasPrefix($0) })
+            || isIntelliJPlatformApp(pid: app.processIdentifier, bundleID: bundleID) {
+            return false
+        }
+        var binds = PointerInterceptor.shared.menuBindsShiftPaste(pid: app.processIdentifier, option: option)
+        if binds == nil {
+            PointerInterceptor.shared.loadLocalizedTitles(pid: app.processIdentifier)
+            if wait {
+                PointerInterceptor.shared.waitForTitles(pid: app.processIdentifier)
+                binds = PointerInterceptor.shared.menuBindsShiftPaste(pid: app.processIdentifier, option: option)
+            }
+        }
+        let browser = browserBundleIDPrefixes.contains { bundleID.hasPrefix($0) }
+        return binds == true || (!option && browser && !shiftPasteClipboardManagerIsRunning())
+    }
 
     // 返回 true 表示吞掉原始按键；返回 false 时原始按键照常到达 App——需要时我们已经先把要粘贴的内容挂到了
     // 系统剪贴板上，App 执行的是一次真正的粘贴：按键顺序、焦点、键盘布局、修饰键都和用户按下时一致。
@@ -1620,55 +1974,72 @@ class GlobalMode {
         if sessionIsLockedNow() {
             return SecureClipboard.shared.hasText
         }
-        guard case .secureText(let text, let concealed) = planPaste() else {
+        let plan = planPaste()
+        if case .native = plan {
             return false
         }
         // 真正拿着焦点的 App（可能是不激活自身的浮动面板）
         let focused = focusedApplication()
-        if chord == .shiftCommand {
-            let bundleID = focused?.bundleIdentifier ?? ""
-            if shiftPasteIsNotPasteBundleIDPrefixes.contains(where: { bundleID.hasPrefix($0) }) {
-                return false
-            }
+        // 虚拟机、远程桌面的客户机画面里刚复制过（交给了客户机自己），Copi 里也没有更新的复制：客户机自己的剪贴板上就是它，
+        // 交给客户机粘贴，不经过这台 Mac 的剪贴板。Copi 里更早的图片、文件也不能挂上去顶替它（存进它们时安全剪贴板的版本也会变）
+        if chord == .command, let focused, let guest = guestCopy, guest.pid == focused.processIdentifier,
+           guest.secureVersion == SecureClipboard.shared.version,
+           withAXBudget(0.2, { isRemoteDesktopGuestDisplay(focusedTarget(), bundleID: focused.bundleIdentifier) }) {
+            return false
         }
-        // ⇧⌘V、⌥⇧⌘V：App 自己的菜单栏把它们当作"粘贴"时接管。不是的话交给 App（别的程序的快捷键、剪贴板管理工具呼出历史），
-        // 只有浏览器里的 ⇧⌘V（网页里的"无格式粘贴"）在没有用 ⇧⌘V 呼出历史的剪贴板管理工具在运行时也接管
-        if chord != .command, let pid = focused?.processIdentifier {
-            let option = chord == .optionShiftCommand
-            var binds = PointerInterceptor.shared.menuBindsShiftPaste(pid: pid, option: option)
-            if binds == nil {
-                PointerInterceptor.shared.loadLocalizedTitles(pid: pid)
-                PointerInterceptor.shared.waitForTitles(pid: pid)
-                binds = PointerInterceptor.shared.menuBindsShiftPaste(pid: pid, option: option)
-            }
-            let browser = browserBundleIDPrefixes.contains { (focused?.bundleIdentifier ?? "").hasPrefix($0) }
-            if binds != true, option || !browser || shiftPasteClipboardManagerIsRunning() {
-                return false
-            }
+        if case .nonText = plan {
+            return pasteNonText(chord: chord, isStale: isStale, keyTime: keyTime)
+        }
+        guard case .secureText(let text, let concealed) = plan else {
+            return false
+        }
+        // ⇧⌘V、⌥⇧⌘V：只在它们在这个 App 里是一种"粘贴"时接管（见 shiftPasteIsPaste）
+        if chord != .command, let focused, !shiftPasteIsPaste(in: focused, option: chord == .optionShiftCommand, wait: true) {
+            return false
         }
         if isStale() {
             return true
         }
         let strict = ZeroExposurePolicy.isStrict
-        // 上一次退回剪贴板方式挂上去的内容还在（在同一个 App 里连按 ⌘V）：续期后照常放行
-        if TransientPaste.shared.isOnPasteboard, TransientPaste.shared.isStaged(for: focused?.processIdentifier), !strict {
+        // 上一次退回剪贴板方式挂上去的这段文字还在（在同一个 App 里连按 ⌘V）：续期后照常放行。续期也是退回剪贴板：有会把本机
+        // 剪贴板同步出去的 App 在运行时（可能是挂上去之后才打开的）一样先提醒，并且马上撤下挂着的这一份
+        if TransientPaste.shared.isOnPasteboard, TransientPaste.shared.isStaged(text, for: focused?.processIdentifier), !strict {
+            // Copi 还在往这个 App 里键入上一次粘贴（或者刚打到一半停下）：续期粘贴进去的文字也会和打了一半的那段混在一起
+            if let pid = focused?.processIdentifier, KeystrokeTyper.shared.isTypingOrJustStopped(into: pid, element: nil, keyTime: keyTime) {
+                keepPendingSnippetUnpasted(text, plannedFromPending: concealed != nil)
+                notifyPasteRefused(.stillTyping, app: RefusedApp(target: nil))
+                return true
+            }
+            if let reason = remoteClipboardConfirmationBeforeFallback(text, targetPID: focused?.processIdentifier, keyTime: keyTime) {
+                TransientPaste.shared.finish()
+                keepPendingSnippetUnpasted(text, plannedFromPending: concealed != nil)
+                notifyPasteRefused(reason, app: RefusedApp(target: nil))
+                return true
+            }
             TransientPaste.shared.stage(text, restorePrevious: false, for: focused?.processIdentifier)
             return false
         }
         // 0 暴露：直接写进焦点控件或模拟键入，全程不经过系统剪贴板。安全剪贴板里的文字是从别的 App 复制来的，
         // 粘贴进放行的 App 时也一样（放行只让那个 App 自己复制的文字留在系统剪贴板上）
         let normalClipboard = ZeroExposurePolicy.usesNormalClipboard(focused?.bundleIdentifier)
-        let (result, app) = withAXBudget(axBudget) { () -> (ZeroExposurePasteResult, RefusedApp) in
+        let (result, app, element) = withAXBudget(axBudget) { () -> (ZeroExposurePasteResult, RefusedApp, AXUIElement?) in
             let target = focusedTarget()
-            return (zeroExposurePaste(text, into: target, keyTime: keyTime, concealed: concealed), RefusedApp(target: target))
+            return (zeroExposurePaste(text, into: target, keyTime: keyTime, concealed: concealed), RefusedApp(target: target), target?.element)
         }
         switch result {
         case .inserted, .typing:
             return true
         case .unavailable(let reason):
-            if strict || !reason.allowsClipboardFallback {
+            if !reason.allowsClipboardFallback {
                 keepPendingSnippetUnpasted(text, plannedFromPending: concealed != nil)
                 notifyPasteRefused(reason, app: app, suffix: normalClipboard ? normalClipboardPasteNote : "")
+                return true
+            }
+            // 默认（不允许剪贴板回退）：这里没有不经过剪贴板的办法。第一次说明为什么，8 秒内用户亲手再粘贴一次才经过剪贴板粘贴
+            if strict, ClipboardPasteConsent.needsConfirmation(text, targetPID: focused?.processIdentifier, element: element, keyTime: keyTime) {
+                keepPendingSnippetUnpasted(text, plannedFromPending: concealed != nil)
+                notifyPasteRefused(reason, app: app, suffix: (normalClipboard ? normalClipboardPasteNote : "") + ClipboardPasteConsent.offer(appName: app.name),
+                                   prompts: true)
                 return true
             }
         }
@@ -1676,7 +2047,7 @@ class GlobalMode {
             return true
         }
         // 有会把本机剪贴板同步出去的 App 在运行：先提醒
-        if let reason = remoteClipboardConfirmationBeforeFallback(text, targetPID: focused?.processIdentifier) {
+        if let reason = remoteClipboardConfirmationBeforeFallback(text, targetPID: focused?.processIdentifier, keyTime: keyTime) {
             keepPendingSnippetUnpasted(text, plannedFromPending: concealed != nil)
             notifyPasteRefused(reason, app: app)
             return true
@@ -1781,7 +2152,9 @@ private final class LockObserver: NSObject {
 // 网页密码框、原生密码框获得焦点（或终端开了"安全键盘输入"）时，系统会开启 Secure Event Input：这期间系统不再把
 // 键盘事件交给任何 event tap，上面的 ⌘C/⌘V 拦截完全看不到按键；而 Override 模式下系统剪贴板已经被清空，原生 ⌘V
 // 只能粘贴出空内容——这就是"网页密码框里粘贴不了"。Carbon 全局热键在 Secure Input 下照常触发，所以这段时间临时
-// 注册 ⌘V（有安全内容时）和 ⌘C 热键来接管。
+// 注册 ⌘V（有安全内容时）和 ⌘C 热键来接管。⇧⌘V、⌥⇧⌘V 只在 ⌘ 按着、拿着焦点的 App 里它们是一种"粘贴"时注册
+// （和 Secure Input 之外接管它们的规则一样，见 GlobalMode.shiftPasteIsPaste），别处（终端的"粘贴选中内容"、JetBrains 的
+// "从历史粘贴"……）不注册，按键照常交给 App。
 final class SecureInputHotKeys {
     private static let signature: OSType = 0x4350_5356 // "CPSV"
 
@@ -1789,6 +2162,9 @@ final class SecureInputHotKeys {
         let id: UInt32
         let letter: Character
         let ansiKeyCode: Int
+        // 热键的修饰键（Carbon），补发按键时带的修饰键
+        let modifiers: Int
+        let flags: CGEventFlags
         // 按下时调用（参数是按键真正按下的时刻）；返回 true 表示松开时要补发这个按键（热键已经把用户的按键吞掉了）
         let onPress: (Date) -> Bool
         var ref: EventHotKeyRef?
@@ -1798,25 +2174,36 @@ final class SecureInputHotKeys {
         // 刚补发过的这段时间里不要重新注册，免得把自己合成的按键当成用户按下的又接一次
         var suppressedUntil = Date.distantPast
 
-        init(id: UInt32, letter: Character, ansiKeyCode: Int, onPress: @escaping (Date) -> Bool) {
+        init(id: UInt32, letter: Character, ansiKeyCode: Int, modifiers: Int = cmdKey, flags: CGEventFlags = .maskCommand,
+             onPress: @escaping (Date) -> Bool) {
             self.id = id
             self.letter = letter
             self.ansiKeyCode = ansiKeyCode
+            self.modifiers = modifiers
+            self.flags = flags
             self.keyCode = CGKeyCode(ansiKeyCode)
             self.onPress = onPress
         }
     }
 
     private let paste: Slot
+    private let shiftPaste: Slot
+    private let optionShiftPaste: Slot
     private let copy: Slot
     private let cut: Slot
-    private var slots: [Slot] { [paste, copy, cut] }
+    private var slots: [Slot] { [paste, shiftPaste, optionShiftPaste, copy, cut] }
     private var handlerRef: EventHandlerRef?
     private var timer: Timer?
     private var layoutObserver: NSObjectProtocol?
 
-    init(onPastePress: @escaping (Date) -> Bool, onCopyPress: @escaping (Date) -> Bool, onCutPress: @escaping (Date) -> Bool) {
-        paste = Slot(id: 1, letter: "v", ansiKeyCode: kVK_ANSI_V, onPress: onPastePress)
+    // onPastePress 后两个参数：按的是不是 ⇧⌘V、⌥⇧⌘V
+    init(onPastePress: @escaping (Date, Bool, Bool) -> Bool, onCopyPress: @escaping (Date) -> Bool, onCutPress: @escaping (Date) -> Bool) {
+        paste = Slot(id: 1, letter: "v", ansiKeyCode: kVK_ANSI_V) { onPastePress($0, false, false) }
+        shiftPaste = Slot(id: 4, letter: "v", ansiKeyCode: kVK_ANSI_V, modifiers: cmdKey | shiftKey, flags: [.maskCommand, .maskShift]) {
+            onPastePress($0, true, false)
+        }
+        optionShiftPaste = Slot(id: 5, letter: "v", ansiKeyCode: kVK_ANSI_V, modifiers: cmdKey | shiftKey | optionKey,
+                                flags: [.maskCommand, .maskShift, .maskAlternate]) { onPastePress($0, true, true) }
         copy = Slot(id: 2, letter: "c", ansiKeyCode: kVK_ANSI_C, onPress: onCopyPress)
         cut = Slot(id: 3, letter: "x", ansiKeyCode: kVK_ANSI_X, onPress: onCutPress)
     }
@@ -1864,9 +2251,17 @@ final class SecureInputHotKeys {
             return
         }
         let secureInput = IsSecureEventInputEnabled()
-        update(paste, wanted: secureInput && GlobalMode.shared.hasSomethingToPaste)
+        let pasteWanted = secureInput && GlobalMode.shared.hasSomethingToPaste
+        update(paste, wanted: pasteWanted)
         update(copy, wanted: secureInput)
         update(cut, wanted: secureInput)
+        // ⇧⌘V、⌥⇧⌘V 要看焦点在哪个 App（辅助功能查询）：只在 ⌘ 按着时看（⌘ 一按下 tap 就会让这里马上再检查一次），不必每次轮询都查。
+        // ⌘ 按没按着看键盘本身的状态：不依赖 tap，tap 漏掉了 ⌘ 的松开（停用、重建期间）也不会一直当作按着、每次轮询都去查焦点。
+        // 注册之后、按下之前焦点换了的，按下时 performPaste 会再按同一条规则看一遍，不是"粘贴"就松开后原样补发
+        let commandDown = CGEventSource.flagsState(.hidSystemState).contains(.maskCommand)
+        let focused = pasteWanted && commandDown ? focusedApplication() : nil
+        update(shiftPaste, wanted: focused.map { GlobalMode.shared.shiftPasteIsPaste(in: $0, option: false, wait: false) } ?? false)
+        update(optionShiftPaste, wanted: focused.map { GlobalMode.shared.shiftPasteIsPaste(in: $0, option: true, wait: false) } ?? false)
     }
 
     private func update(_ slot: Slot, wanted: Bool) {
@@ -1892,7 +2287,7 @@ final class SecureInputHotKeys {
         let keyCode = KeyboardLayout.commandKeyCode(for: slot.letter) ?? CGKeyCode(slot.ansiKeyCode)
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(UInt32(keyCode),
-                                         UInt32(cmdKey),
+                                         UInt32(slot.modifiers),
                                          EventHotKeyID(signature: Self.signature, id: slot.id),
                                          GetEventDispatcherTarget(),
                                          0,
@@ -1973,7 +2368,29 @@ final class SecureInputHotKeys {
         // 先注销热键，免得合成的按键又被自己接住；合成的按键处理完之后马上重新注册，不留空窗
         unregister(slot)
         slot.suppressedUntil = Date().addingTimeInterval(0.08)
-        postKeystroke(keyCode: slot.keyCode)
+        postKeystroke(keyCode: slot.keyCode, flags: slot.flags)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.updateNow()
+        }
+    }
+
+    // 主线程：Copi 自己替用户按一次 ⌘V（用户确认之后退回剪贴板方式，见 refuseOrFallBack、safePaste）。⌘V 热键注册着时
+    //（Secure Input 期间）合成的按键会被自己接住、当成用户又按了一次（不是亲手按的，确认不了），粘贴永远到不了 App：
+    // 和 handleRelease 一样先注销、发完马上重新注册。用户还按着 ⌘V 时等松开再发（按着的时候合成同一个键可能被系统丢掉），
+    // 松开时由 handleRelease 照常先注销再补发
+    func postPaste() {
+        guard paste.ref != nil else {
+            postPasteKeystroke()
+            return
+        }
+        if let pressedAt = paste.pressedAt, Date().timeIntervalSince(pressedAt) <= 3 {
+            paste.postOnRelease = true
+            return
+        }
+        paste.pressedAt = nil
+        unregister(paste)
+        paste.suppressedUntil = Date().addingTimeInterval(0.08)
+        postKeystroke(keyCode: paste.keyCode, flags: paste.flags)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.updateNow()
         }

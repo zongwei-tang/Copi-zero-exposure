@@ -300,12 +300,13 @@ func browserMoreTests(_ browser: (String, String), short: String, _ openedWindow
         }
         let menuSampler = PasteboardSampler(.general)
         let menuClicked = try clickMenuItem(plain, commandChar: "C")
+        let menuState = lastMenuClickState
         sleepMS(500)
         menuSampler.stop()
         let menuValue = try pasteIntoNewTextEdit("dst-\(short)-menu-\(attempt).txt", &openedWindows)
         let ok = menuClicked && (menuValue == expected || menuValue == expectedWebKit) && menuSampler.firstSeenMS == nil
         menuPassed += ok ? 1 : 0
-        menuNotes.append("第 \(attempt) 次：点到菜单项=\(menuClicked)，\(menuSampler.summary)，\(menuValue == expected || menuValue == expectedWebKit ? "内容一致" : (menuValue == "Copi menu sentinel \(attempt)" ? "Copi 里还是复制之前放的那段（没复制上）" : describeDiff(menuValue, expected)))")
+        menuNotes.append("第 \(attempt) 次：点到菜单项=\(menuClicked)（\(menuState)），\(menuSampler.summary)，\(menuValue == expected || menuValue == expectedWebKit ? "内容一致" : (menuValue == "Copi menu sentinel \(attempt)" ? "Copi 里还是复制之前放的那段（没复制上）" : describeDiff(menuValue, expected)))")
     }
     record("\(short).7", "\(short) 编辑菜单 › 拷贝（网页正文，\(menuTries) 次）", menuPassed == menuTries ? "PASS" : (menuNotes.allSatisfy { $0.contains("跳过") } ? "SKIP" : "FAIL"),
            "\(menuPassed)/\(menuTries) 次成功；" + menuNotes.joined(separator: "；"))
@@ -377,15 +378,13 @@ func fakeSudoTest(_ openedWindows: inout [TestWindow]) throws {
     sleepMS(1200)
     let markers = fixtures.appendingPathComponent("markers")
     try? FileManager.default.createDirectory(at: markers, withIntermediateDirectories: true)
-    let result = markers.appendingPathComponent("fakesudo.txt")
-    try? FileManager.default.removeItem(at: result)
-    try gate(term)
-    typeText("'\(fakeSudo.path)' '\(result.path)'")
-    pressReturn()
-    // 半路中止时：假 sudo 还在等一行，按一次回车让它结束（它自己 60 秒后也会退出），再退出测试 shell
+    // 最近一次启动的假 sudo 写结果的文件（还没有这个文件：它还在等一行）
+    var waiting: URL?
+    // 半路中止时：假 sudo 还在等一行，清掉这一行（⌃U）再按回车让它结束（它自己 60 秒后也会退出），再退出测试 shell
     defer {
         if (try? gate(term)) != nil {
-            if !FileManager.default.fileExists(atPath: result.path) {
+            if let waiting, !FileManager.default.fileExists(atPath: waiting.path) {
+                chord(CGKeyCode(kVK_ANSI_U), ctrl)
                 pressReturn()
                 sleepMS(500)
             }
@@ -393,21 +392,52 @@ func fakeSudoTest(_ openedWindows: inout [TestWindow]) throws {
             pressReturn()
         }
     }
-    sleepMS(1500)
+    // 启动假 sudo，经 Copi 粘贴 text 再按回车，返回提示符读到的一行（长度和哈希）。没读到时为 nil，并且清掉这一行再按回车，
+    // 让假 sudo 结束（打进去的字占满了终端的行缓冲区时，回车也进不去）
+    func pasteAtFakeSudo(_ text: String, _ name: String, typingMS: Int) throws -> String? {
+        let result = markers.appendingPathComponent("\(name).txt")
+        try? FileManager.default.removeItem(at: result)
+        try gate(term)
+        typeText("'\(fakeSudo.path)' '\(result.path)'")
+        pressReturn()
+        waiting = result
+        sleepMS(1500)
+        try loadCopi(text, "src-\(name).txt", &openedWindows)
+        bringToFront(term)
+        try gate(term)
+        chord(keyV(), cmd)
+        sleepMS(typingMS)
+        try gate(term)
+        pressReturn()
+        sleepMS(1500)
+        let written = (try? String(contentsOf: result, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if written == nil {
+            try gate(term)
+            chord(CGKeyCode(kVK_ANSI_U), ctrl)
+            pressReturn()
+            sleepMS(1000)
+        }
+        return written
+    }
     let secret = "Not-a-real-password_42"
-    try loadCopi(secret, "src-sudo.txt", &openedWindows)
-    bringToFront(term)
-    try gate(term)
-    chord(keyV(), cmd)
-    sleepMS(3000)
-    try gate(term)
-    pressReturn()
-    sleepMS(1500)
-    let written = (try? String(contentsOf: result, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let written = try pasteAtFakeSudo(secret, "fakesudo", typingMS: 3000)
     let want = "len=\(secret.utf16.count)|h=\(djb2(secret))"
     let shown = terminalText(term).contains(secret)
     record("T.7", "sudo 密码提示符（假 sudo：进程名 sudo、关回显整行读）", written == want && !shown ? "PASS" : "FAIL",
            "提示符读到的内容\(written == want ? "完全一致" : "不对（读到 \(written ?? "nil")，期望 \(want)）")；密码出现在屏幕上=\(shown)")
+
+    // README：整行读的提示符（终端的行缓冲区只有 1024 字节，多出来的连同回车都被丢掉）一行超过约 1000 字节时 Copi 一个字都不打。
+    // 400 个汉字是 1200 字节、只有 400 个 UTF-16 单元：按字节算才会拒绝，回车之后提示符读到空行；正好 1000 字节的一行照常完整打进去
+    let longLine = String(repeating: "测试文字", count: 100)
+    let longWritten = try pasteAtFakeSudo(longLine, "fakesudo-long", typingMS: 3000)
+    let empty = "len=0|h=\(djb2(""))"
+    record("T.7b", "sudo 密码提示符：一行 1200 字节（400 个汉字）一个字都不打", longWritten == empty ? "PASS" : "FAIL",
+           longWritten == empty ? "提示符读到空行" : "提示符读到 \(longWritten ?? "nil（回车没进去，行缓冲区可能被占满了）")，期望空行")
+    let fullLine = String(repeating: "Not-a-real-password_", count: 50)
+    let fullWritten = try pasteAtFakeSudo(fullLine, "fakesudo-full", typingMS: 4000)
+    let fullWant = "len=\(fullLine.utf16.count)|h=\(djb2(fullLine))"
+    record("T.7c", "sudo 密码提示符：一行正好 1000 字节照常完整打进去", fullWritten == fullWant ? "PASS" : "FAIL",
+           fullWritten == fullWant ? "完全一致" : "读到 \(fullWritten ?? "nil")，期望 \(fullWant)")
 }
 
 // MARK: - 虚拟机、远程桌面在运行时：经过剪贴板的粘贴先询问
@@ -1060,7 +1090,7 @@ func concealedTests(_ openedWindows: inout [TestWindow]) throws {
         usleep(1000)
     }
     let exposure = first.map { (last ?? $0) - $0 + 1 } ?? 0
-    let limit = copiBool("constantFastCheck", false) ? 10 : (copiBool("instantClipboardDetection", false) ? 15 : 35)
+    let limit = copiBool("constantFastCheck", false) ? 10 : (copiBool("instantClipboardDetection", true) ? 15 : 35)
     let stillThere = pasteboardHasText(.general)
     let c1 = stillThere || exposure > 50 ? "FAIL" : (exposure <= limit ? "PASS" : "CHECK")
     record("C.1", "密码管理器式的复制（带 Concealed 标记）：Copi 挪走", c1,

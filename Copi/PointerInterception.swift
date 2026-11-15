@@ -11,6 +11,7 @@
 //     让菜单项照常执行，写进系统剪贴板的内容随后由轮询转移走；
 //   - 拖动选中的文字：在 App 开始拖放（把文字写进拖放剪贴板）之前认出"按下的位置在选中的文字上"，不让这次拖动开始；
 //     没认出来、App 已经写进拖放剪贴板的，立刻清掉（这次拖放就放不下了）。文件、图片、链接照常拖放。
+//  另外记下 Firefox 里用 ⌘ 添过选区的地方（它不说选了几段），那里的 ⌘C/⌘X 拒绝（见 mayHaveSeveralGeckoRanges）。
 //  菜单开着时用方向键（或打字）选中这几项、按回车，也在菜单项执行之前接管（见 MenuTracker）。
 //  App 界面里的"复制"按钮不在此列（写进系统剪贴板后由轮询转移走）。
 //
@@ -61,6 +62,26 @@ final class PointerInterceptor {
     private var titlesFailedAt: [pid_t: Date] = [:]
     // 读标题要几百次 Accessibility 查询，不和按下时的命中测试排在同一个队列里
     private let titleQueue = DispatchQueue(label: "Copi.MenuTitles", qos: .userInitiated)
+
+    // Firefox 系的 App 里 ⌘点按、⌘拖动会再添一段选区，它却不提供 AXSelectedTextRanges，看不出选了几段（Copi 只读得到第一段，
+    // ⌘X 却会把每一段都删掉）。记下这样按过的地方：选区归谁（<input>/<textarea> 有自己的选区，别处是整个网页的），
+    // 在那里不按修饰键点了文字（选区收拢成一段）、它没了（网页关掉、跳转走了）时才去掉。见 mayHaveSeveralGeckoRanges
+    private struct RangeMark {
+        let pid: pid_t
+        // nil：认不出按在了哪里，这个 App 里都算
+        let owner: AXUIElement?
+    }
+    private let rangeLock = NSLock()
+    // 以下在 rangeLock 里读写；rangeMarks 只在 rangeQueue 上改
+    private var rangeMarks: [RangeMark] = []
+    // 排了队、还没查完的 ⌘按下
+    private var pendingRangePresses = 0
+    // 左键按下的编号；排了队的不按修饰键的按下（松开时再决定去不去掉记号），以及它查出来可以去掉的记号（之后又 ⌘按下过就作废）
+    private var pressSerial = 0
+    private var queuedPlainPress: Int?
+    private var pendingClear: (serial: Int, mark: RangeMark)?
+    // 往上找选区归谁要好几次 Accessibility 查询：不和按下时的命中测试排在同一个队列里（松开时要等它）
+    private let rangeQueue = DispatchQueue(label: "Copi.SelectionRanges", qos: .userInteractive)
 
     private enum DragDecision {
         case allow
@@ -145,6 +166,7 @@ final class PointerInterceptor {
                 lock.unlock()
                 hitTestQueue.async(execute: work)
             }
+            noteRangePress(at: location, flags: event.flags)
             DispatchQueue.main.async {
                 DragGuard.shared.mouseDown()
             }
@@ -152,6 +174,8 @@ final class PointerInterceptor {
         case .leftMouseDragged:
             return shouldBlockDrag(event)
         case .leftMouseUp, .rightMouseUp:
+            // 这次松开是不是用户亲手按的鼠标（见 hardwareInput）：在等命中测试、查菜单项之前就看
+            let deliberate = hardwareInput(event.type, at: Date())
             if event.type == .leftMouseUp {
                 DispatchQueue.main.async {
                     DragGuard.shared.mouseUp()
@@ -167,6 +191,10 @@ final class PointerInterceptor {
             let blocking = dragDecision == .block
             dragDecision = nil
             lock.unlock()
+            if event.type == .leftMouseUp {
+                let clicked = down.map { max(abs(location.x - $0.x), abs(location.y - $0.y)) < 4 } ?? false
+                finishPlainPress(collapsed: clicked || blocking)
+            }
             // 拦下了一次拖动（只是在选区里点了一下、手抖了几个像素的不算）
             if blocking, let down, max(abs(location.x - down.x), abs(location.y - down.y)) >= 4 {
                 DispatchQueue.main.async {
@@ -191,7 +219,7 @@ final class PointerInterceptor {
                hypot(location.x - context.location.x, location.y - context.location.y) < 5 {
                 return false
             }
-            return interceptMenuItem(at: location, context: context, time: Date())
+            return interceptMenuItem(at: location, context: context, time: Date(), deliberate: deliberate)
         default:
             return false
         }
@@ -223,8 +251,9 @@ final class PointerInterceptor {
         lock.unlock()
     }
 
-    // 松开的位置是一个"拷贝/剪切/粘贴"菜单项：吞掉这次松开（菜单项就不会执行），交给主线程处理
-    private func interceptMenuItem(at location: CGPoint, context: ContextClick?, time: Date) -> Bool {
+    // 松开的位置是一个"拷贝/剪切/粘贴"菜单项：吞掉这次松开（菜单项就不会执行），交给主线程处理。
+    // deliberate：这次松开是用户亲手按的鼠标（见 perform）
+    private func interceptMenuItem(at location: CGPoint, context: ContextClick?, time: Date, deliberate: Bool) -> Bool {
         guard let element = Self.element(at: location) else {
             return false
         }
@@ -237,10 +266,11 @@ final class PointerInterceptor {
             return false
         }
         var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success, pid != getpid(),
-              let action = menuAction(of: element, pid: pid, allowTitles: context != nil),
-              Defaults[.isOn], GlobalMode.shared.isProtectingNow else {
+        guard AXUIElementGetPid(element, &pid) == .success, pid != getpid(), Defaults[.isOn], GlobalMode.shared.isProtectingNow else {
             return false
+        }
+        guard let action = menuAction(of: element, pid: pid, allowTitles: context != nil) else {
+            return interceptClipboardReadingItem(element, pid: pid, time: time, deliberate: deliberate)
         }
         // 拷贝/剪切要求菜单项可用；"粘贴"灰掉多半正是因为 Copi 让系统剪贴板保持为空（NSTextView、Chrome 这时会禁用它）
         if action == .copy || action == .cut, (copyAXAttribute(element, kAXEnabledAttribute) as? Bool) == false {
@@ -270,10 +300,72 @@ final class PointerInterceptor {
         setMenu(open: false, context: nil)
         DispatchQueue.main.async {
             MouseEventCatcher.shared.pressConsumed()
-            PointerInterceptor.perform(action, closing: menu, pid: pid, time: time)
+            PointerInterceptor.perform(action, closing: menu, pid: pid, time: time, deliberate: deliberate)
         }
         return true
     }
+
+    // 自己去读剪贴板的菜单项（预览的"从剪贴板新建"、图片编辑器的"从剪贴板新建文稿"……）：Copi 里存着图片、文件（剪贴板是空的）时，
+    // 吞掉这次松开，先把它们放回剪贴板（和粘贴时一样短暂、带标记），再替用户按下这一项（剪贴板空着时它可能是灰的，放回之后就能用了，
+    // 所以不看它可不可用）。不要求是拿着键盘焦点的 App 的菜单：放回去的是给这一项所属的 App 读的，Copi 不读写焦点所在的地方；
+    // 状态栏菜单（上传工具的"上传剪贴板里的图片"）、后台窗口的右键菜单里的这种项也要能用。有会把剪贴板同步出去的 App 在运行时，
+    // 不管是哪个菜单都先问（见 stageNonTextForApp）
+    private func interceptClipboardReadingItem(_ element: AXUIElement, pid: pid_t, time: Date, deliberate: Bool) -> Bool {
+        guard NonTextClipboard.shared.hasContent, !SecureClipboard.shared.hasText, Self.readsClipboardItself(element, pid: pid) else {
+            return false
+        }
+        let menu = asAXElement(copyAXAttribute(element, kAXParentAttribute))
+        setMenu(open: false, context: nil)
+        DispatchQueue.main.async {
+            MouseEventCatcher.shared.pressConsumed()
+            if GlobalMode.shared.stageNonTextForApp(pid: pid, time: time, deliberate: deliberate) {
+                AXUIElementPerformAction(element, kAXPressAction as CFString)
+            } else {
+                // 只提醒、没有放回去：不按（它会去读空着的剪贴板），关掉菜单
+                Self.closeMenu(menu, pid: pid)
+            }
+        }
+        return true
+    }
+
+    // 标题里有"剪贴板"的菜单项，以及文件管理器里快捷键是 ⌥⌘V 的那一项（访达按住 ⌥ 时的"移动到这里"，标题里没有"剪贴板"）。
+    // 往剪贴板里写、清空剪贴板的项（"Copy Link to Clipboard""Capture Area to Clipboard""Clear Clipboard"）不读剪贴板：
+    // 不放回 Copi 存着的图片、文件，也不问（会把剪贴板同步出去的 App 在运行时，问了就不按，用户要的复制、截图就没做成），
+    // 照常交给 App，它写进来的内容随后照常转移走
+    private static func readsClipboardItself(_ element: AXUIElement, pid: pid_t) -> Bool {
+        if let title = (copyAXAttribute(element, kAXTitleAttribute) as? String)?.lowercased(),
+           clipboardWords.contains(where: { title.contains($0) }), !clipboardWritingWords.contains(where: { title.contains($0) }) {
+            return true
+        }
+        let character = (copyAXAttribute(element, kAXMenuItemCmdCharAttribute) as? String)?.uppercased()
+        // 修饰键：2 是 ⌥⌘（见 menuAction）
+        let modifiers = (copyAXAttribute(element, kAXMenuItemCmdModifiersAttribute) as? NSNumber)?.intValue ?? 0
+        guard character == "V", modifiers == 2, let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else {
+            return false
+        }
+        return fileManagerBundleIDs.contains(bundleID)
+    }
+
+    // 各种语言里的"剪贴板"
+    private static let clipboardWords = [
+        "clipboard", "剪贴板", "剪貼簿", "クリップボード", "클립보드", "zwischenablage", "presse-papiers", "portapapeles", "appunti",
+        "klembord", "área de transferência", "буфер обмена", "schowek", "urklipp", "udklipsholder", "utklippstavle", "leikepöytä",
+    ]
+
+    // 各种语言里"（拷贝、截图……）到剪贴板""清空剪贴板"的说法。只认写往剪贴板的说法，不单独认"拷贝""剪切"这些动词
+    // （"Copy Clipboard Image to…"读剪贴板；丹麦语的剪贴板 udklipsholder 里就有剪切 klip）；"保存剪贴板""显示剪贴板"读剪贴板，不算。
+    // 日语、韩语只认带着"拷贝"的说法："クリップボードに""클립보드에"也出现在"剪贴板里的图片""从剪贴板"里
+    private static let clipboardWritingWords = [
+        "to clipboard", "to the clipboard", "into clipboard", "into the clipboard", "clear",
+        "到剪贴板", "至剪贴板", "到剪貼簿", "至剪貼簿", "清空", "清除",
+        "クリップボードにコピー", "クリップボードへコピー", "クリップボードをクリア", "클립보드에 복사", "클립보드로 복사",
+        "in die zwischenablage", "in zwischenablage", "zwischenablage leeren", "dans le presse-papiers", "vers le presse-papiers",
+        "vider le presse-papiers", "al portapapeles", "negli appunti", "naar klembord", "naar het klembord", "в буфер обмена",
+        "till urklipp", "til udklipsholder", "til utklippstavle", "para a área de transferência", "para área de transferência",
+        // 别的语言里的"清空"（标题里先要有"剪贴板"才看到这里，这些动词不会误伤别的菜单项）
+        "消去", "löschen", "effacer", "vaciar", "borrar", "svuota", "limpar", "wissen", "leegmaken", "очистить", "rensa", "töm",
+        "ryd", "tøm", "tyhjennä", "wyczyść", "지우기", "비우기",
+    ]
 
     // 键盘 tap 线程（GlobalMode）：菜单开着时按回车（或小键盘的 Enter）执行高亮的那一项。高亮的是"拷贝/剪切/粘贴"时吞掉这次按键，
     // 和点击一样关掉菜单、交给 Copi 处理。按住回车的自动重复也吞掉（菜单已经关了，否则会落进文本框里）。
@@ -291,6 +383,8 @@ final class PointerInterceptor {
             defer { lock.unlock() }
             return swallowRepeats.map { $0.keyCode == keyCode && Date() < $0.until } ?? false
         }
+        // 这次回车是不是用户亲手按的（见 hardwareInput）：在查菜单之前就看
+        let deliberate = hardwareInput(.keyDown, at: Date())
         lock.lock()
         // 新的一次按下：上一次按住已经松开了，它的自动重复不用再吞
         swallowRepeats = nil
@@ -353,7 +447,7 @@ final class PointerInterceptor {
         lock.unlock()
         let time = Date()
         DispatchQueue.main.async {
-            PointerInterceptor.perform(action, closing: highlighted.rootMenu, pid: pid, time: time)
+            PointerInterceptor.perform(action, closing: highlighted.rootMenu, pid: pid, time: time, deliberate: deliberate)
         }
         return true
     }
@@ -390,10 +484,296 @@ final class PointerInterceptor {
         return block
     }
 
+    // MARK: Firefox 的多段选区
+
+    // tap 线程：左键按下。⌘按下（可能添了一段选区）都去查按在了哪里；不按修饰键的按下只在有记号时才查（⇧点按只扩展一段，
+    // 别的几段还在）。都在 rangeQueue 上查，这里不做 Accessibility 查询
+    private func noteRangePress(at location: CGPoint, flags: CGEventFlags) {
+        let adds = flags.contains(.maskCommand)
+        let option = flags.contains(.maskAlternate)
+        rangeLock.lock()
+        pressSerial += 1
+        let serial = pressSerial
+        let plain = flags.isDisjoint(with: [.maskCommand, .maskShift, .maskControl, .maskAlternate]) && !rangeMarks.isEmpty
+        queuedPlainPress = plain ? serial : nil
+        if adds {
+            pendingRangePresses += 1
+        }
+        rangeLock.unlock()
+        guard adds || plain else {
+            return
+        }
+        rangeQueue.async { [self] in
+            guard adds else {
+                findClearableMark(at: location, serial: serial)
+                return
+            }
+            let mark = rangeMark(at: location, option: option)
+            rangeLock.lock()
+            if let mark {
+                rangeMarks.removeAll { existing in
+                    existing.pid == mark.pid && Self.sameOwner(existing.owner, mark.owner)
+                }
+                rangeMarks.append(mark)
+                if rangeMarks.count > 32 {
+                    // 挤出去的地方可能还选着几段，不能直接丢：改记成整个 App 的（之后在那个 App 里点一下文字才去掉）
+                    let dropped = rangeMarks.prefix(rangeMarks.count - 32)
+                    rangeMarks.removeFirst(rangeMarks.count - 32)
+                    for pid in Set(dropped.map(\.pid)) where !rangeMarks.contains(where: { $0.pid == pid && $0.owner == nil }) {
+                        rangeMarks.append(RangeMark(pid: pid, owner: nil))
+                    }
+                }
+            }
+            // 之前那次不按修饰键的按下查出来的记号不再去掉：它松开后要先绕主线程一趟才回到 rangeQueue，主线程慢了一拍时会排在
+            // 这次添加之后，把刚添的记号删掉（不管这次记没记下来都作废，至多多拒绝几次）
+            pendingClear = nil
+            pendingRangePresses -= 1
+            rangeLock.unlock()
+            if mark != nil {
+                pruneRangeMarks()
+            }
+        }
+    }
+
+    // rangeQueue：⌘按下添了选区时要记下的地方。在链接、图片上按下（没按着 ⌥）时 Firefox 是准备拖放，不动选区；
+    // 按在浏览器自己的界面（标签栏、工具栏）上的不管
+    private func rangeMark(at location: CGPoint, option: Bool) -> RangeMark? {
+        let hit = Self.element(at: location)
+        var hitPID: pid_t = 0
+        // 点中的读不出来：按拿着键盘焦点的 App 算
+        guard let pid = hit.flatMap({ AXUIElementGetPid($0, &hitPID) == .success ? hitPID : nil }) ?? Self.focusedApplication().pid,
+              isGeckoApp(pid: pid, bundleIdentifier: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier) else {
+            return nil
+        }
+        guard let hit else {
+            return RangeMark(pid: pid, owner: Self.focusedOwner(pid: pid))
+        }
+        AXUIElementSetMessagingTimeout(hit, 0.1)
+        let lookup = Self.selectionOwner(of: hit, pid: pid, deadline: .now() + .milliseconds(250))
+        if lookup.failed {
+            return RangeMark(pid: pid, owner: Self.focusedOwner(pid: pid))
+        }
+        guard let owner = lookup.owner, !lookup.draggable || option else {
+            return nil
+        }
+        return RangeMark(pid: pid, owner: owner)
+    }
+
+    // rangeQueue：不按修饰键的按下。按在有记号的地方的文字上（或者输入框本身），选区就收拢成一段了：先记下，松开时再决定
+    // （见 finishPlainPress）。按在网页空白处、滚动条、链接、图片、按钮上不一定动选区，不算
+    private func findClearableMark(at location: CGPoint, serial: Int) {
+        var found: RangeMark?
+        defer {
+            rangeLock.lock()
+            pendingClear = found.map { (serial: serial, mark: $0) }
+            rangeLock.unlock()
+        }
+        var pid: pid_t = 0
+        guard let hit = Self.element(at: location), AXUIElementGetPid(hit, &pid) == .success else {
+            return
+        }
+        rangeLock.lock()
+        let marked = rangeMarks.contains { $0.pid == pid }
+        rangeLock.unlock()
+        guard marked else {
+            return
+        }
+        AXUIElementSetMessagingTimeout(hit, 0.1)
+        let lookup = Self.selectionOwner(of: hit, pid: pid, deadline: .now() + .milliseconds(250))
+        guard !lookup.failed, let owner = lookup.owner, !lookup.draggable, !lookup.inControl,
+              lookup.hitRole == kAXStaticTextRole || (lookup.hitRole != "AXWebArea" && CFEqual(hit, owner)) else {
+            return
+        }
+        found = RangeMark(pid: pid, owner: owner)
+    }
+
+    // tap 线程：左键松开。按下时排了队的不按修饰键的按下：没拖动（或者拖动被 Copi 拦下，Firefox 只收到按下和松开）时选区已经收拢；
+    // 拖动了的可能是在拖放选中的文字（选区不变），拖放剪贴板没变过（是在拖选）才算收拢。紧接着 DragGuard.mouseUp 在主线程上看
+    // （赶在下一次按下重设基准之前），再回到 rangeQueue 上去掉这次按下查出来的记号（已经换成下一次按下的、之后又 ⌘按下过的就不动）
+    private func finishPlainPress(collapsed: Bool) {
+        rangeLock.lock()
+        let serial = queuedPlainPress
+        queuedPlainPress = nil
+        rangeLock.unlock()
+        guard let serial else {
+            return
+        }
+        DispatchQueue.main.async { [self] in
+            let collapsedNow = collapsed || !DragGuard.shared.dragPasteboardChangedSinceMouseDown
+            rangeQueue.async { [self] in
+                rangeLock.lock()
+                let clear = pendingClear?.serial == serial ? pendingClear?.mark : nil
+                if clear != nil {
+                    pendingClear = nil
+                }
+                rangeLock.unlock()
+                if collapsedNow, let clear {
+                    removeRangeMarks(like: clear)
+                }
+            }
+        }
+    }
+
+    // rangeQueue：去掉这个地方的记号，以及这个 App 里认不出地方的记号
+    private func removeRangeMarks(like clear: RangeMark) {
+        rangeLock.lock()
+        rangeMarks.removeAll { mark in
+            mark.pid == clear.pid && (mark.owner == nil || Self.sameOwner(mark.owner, clear.owner))
+        }
+        rangeLock.unlock()
+    }
+
+    // rangeQueue：去掉已经没了的地方（网页关掉、跳转走了，App 退出了）的记号
+    private func pruneRangeMarks() {
+        rangeLock.lock()
+        let marks = rangeMarks
+        rangeLock.unlock()
+        let alive = marks.filter { mark in
+            guard NSRunningApplication(processIdentifier: mark.pid) != nil else {
+                return false
+            }
+            guard let owner = mark.owner else {
+                return true
+            }
+            var value: CFTypeRef?
+            return AXUIElementCopyAttributeValue(owner, kAXRoleAttribute as CFString, &value) != .invalidUIElement
+        }
+        guard alive.count < marks.count else {
+            return
+        }
+        rangeLock.lock()
+        rangeMarks = alive
+        rangeLock.unlock()
+    }
+
+    // 主线程：App 退出了（进程号以后会给别的进程）：去掉它的记号
+    func forgetRangeMarks(pid: pid_t) {
+        rangeQueue.async { [self] in
+            rangeLock.lock()
+            rangeMarks.removeAll { $0.pid == pid }
+            rangeLock.unlock()
+        }
+    }
+
+    // 主线程（⌘C/⌘X、安全复制的处理里）：Firefox 系的 App（pid）里，焦点所在地方的选区可能不止一段
+    func mayHaveSeveralGeckoRanges(focus element: AXUIElement, pid: pid_t) -> Bool {
+        // 刚 ⌘按下、还没查完按在了哪里：最多等 150 毫秒，还没查完就当作选了多段
+        for _ in 0..<15 {
+            rangeLock.lock()
+            let pending = pendingRangePresses
+            rangeLock.unlock()
+            guard pending > 0 else {
+                break
+            }
+            usleep(10_000)
+        }
+        rangeLock.lock()
+        let pending = pendingRangePresses
+        let marks = rangeMarks.filter { $0.pid == pid }
+        rangeLock.unlock()
+        if pending > 0 || marks.contains(where: { $0.owner == nil }) {
+            return true
+        }
+        guard !marks.isEmpty else {
+            return false
+        }
+        let lookup = Self.selectionOwner(of: element, pid: pid, deadline: .now() + .milliseconds(150))
+        // 读不出焦点在哪里：当作就在有记号的地方
+        if lookup.failed {
+            return true
+        }
+        guard let owner = lookup.owner else {
+            return false
+        }
+        return marks.contains { Self.sameOwner($0.owner, owner) }
+    }
+
+    private struct OwnerLookup {
+        // 选区归谁：<input>/<textarea>（各有自己的选区），或者网页（AXWebArea；contenteditable 用的也是网页的选区）。
+        // nil：不在网页里（标签栏、工具栏这类浏览器自己的界面；地址栏是输入框，选区归它自己）
+        var owner: AXUIElement?
+        // 往上找的途中读不出来（超时、读不到上一层）
+        var failed = false
+        // 在链接、图片里，并且不在可编辑的地方（Firefox 在可以拖动的东西上按下是准备拖放，不动选区）
+        var draggable = false
+        // 在按钮这类控件里（点它们不一定动选区）
+        var inControl = false
+        // 起点元素的角色
+        var hitRole: String?
+    }
+
+    private static let selectionControlRoles: Set<String> = [
+        kAXButtonRole, kAXPopUpButtonRole, kAXMenuButtonRole, kAXCheckBoxRole, kAXRadioButtonRole, kAXSliderRole, kAXDisclosureTriangleRole,
+    ]
+
+    // 从 element（可以就是网页根节点或输入框）往上找选区归谁，最多找到 deadline
+    // rangeQueue：点中的地方查不出来时，按拿着键盘焦点的地方记（⌘点按网页内容之后焦点通常就在那个网页或输入框里）：只在那里点一下
+    // 文字才去掉这个记号。也查不出来时为 nil（整个 App 都算，在这个 App 里点一下文字就去掉）
+    private static func focusedOwner(pid: pid_t) -> AXUIElement? {
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 0.1)
+        guard let focused = asAXElement(copyAXAttribute(application, kAXFocusedUIElementAttribute)) else {
+            return nil
+        }
+        AXUIElementSetMessagingTimeout(focused, 0.1)
+        let lookup = selectionOwner(of: focused, pid: pid, deadline: .now() + .milliseconds(150))
+        return lookup.failed ? nil : lookup.owner
+    }
+
+    private static func selectionOwner(of element: AXUIElement, pid: pid_t, deadline: DispatchTime) -> OwnerLookup {
+        var lookup = OwnerLookup()
+        var node = element
+        for depth in 0..<64 {
+            guard DispatchTime.now() < deadline, let role = copyAXAttribute(node, kAXRoleAttribute) as? String else {
+                lookup.failed = true
+                return lookup
+            }
+            if depth == 0 {
+                lookup.hitRole = role
+            }
+            if role == "AXWebArea" {
+                lookup.owner = node
+                return lookup
+            }
+            if role == kAXTextFieldRole || role == kAXComboBoxRole || role == kAXTextAreaRole {
+                if FocusedTarget(element: node, pid: pid).isGeckoTextControl {
+                    lookup.owner = node
+                    return lookup
+                }
+                // 可编辑的地方（contenteditable）里的链接、图片照常可以选
+                lookup.draggable = false
+            }
+            if role == kAXWindowRole || role == kAXApplicationRole {
+                return lookup
+            }
+            if role == "AXLink" || role == kAXImageRole {
+                lookup.draggable = true
+            }
+            if selectionControlRoles.contains(role) {
+                lookup.inControl = true
+            }
+            guard let parent = asAXElement(copyAXAttribute(node, kAXParentAttribute)) else {
+                lookup.failed = true
+                return lookup
+            }
+            AXUIElementSetMessagingTimeout(parent, 0.1)
+            node = parent
+        }
+        lookup.failed = true
+        return lookup
+    }
+
+    private static func sameOwner(_ first: AXUIElement?, _ second: AXUIElement?) -> Bool {
+        guard let first, let second else {
+            return first == nil && second == nil
+        }
+        return CFEqual(first, second)
+    }
+
     // MARK: 主线程
 
-    // 关掉菜单（菜单还在等这次松开），等焦点回到原来的控件上，再像按了快捷键一样处理
-    private static func perform(_ action: MenuAction, closing menu: AXUIElement?, pid: pid_t, time: Date) {
+    // 关掉菜单（菜单还在等这次松开）
+    private static func closeMenu(_ menu: AXUIElement?, pid: pid_t) {
         var closed = false
         if let menu {
             closed = AXUIElementPerformAction(menu, kAXCancelAction as CFString) == .success
@@ -402,17 +782,26 @@ final class PointerInterceptor {
             // 菜单还在跟踪鼠标：esc 只会关掉菜单
             postKeystroke(keyCode: CGKeyCode(kVK_Escape), flags: [], to: pid)
         }
+    }
+
+    // 关掉菜单，等焦点回到原来的控件上，再像按了快捷键一样处理。
+    // deliberate：用户亲手点的、按的回车才算"再复制/粘贴一次"的确认（硬件层刚才没记下点击、按键时别的程序合成的不算，见 hardwareInput）
+    private static func perform(_ action: MenuAction, closing menu: AXUIElement?, pid: pid_t, time: Date, deliberate: Bool) {
+        closeMenu(menu, pid: pid)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             switch action {
             case .copy, .cut:
                 // Copi 不接管时（例如 Finder 里复制文件）替 App 按一次快捷键，和菜单项的效果一样
+                if deliberate {
+                    CopyPress.noteDeliberate(at: time)
+                }
                 if !GlobalMode.shared.handleCopy(cut: action == .cut, keyTime: time) {
                     let letter: Character = action == .cut ? "x" : "c"
                     let keyCode = KeyboardLayout.commandKeyCode(for: letter) ?? CGKeyCode(action == .cut ? kVK_ANSI_X : kVK_ANSI_C)
                     postKeystroke(keyCode: keyCode, flags: .maskCommand, to: pid)
                 }
             case .paste(let shift, let option):
-                if !GlobalMode.shared.handleMenuPaste(shift: shift, option: option, keyTime: time) {
+                if !GlobalMode.shared.handleMenuPaste(shift: shift, option: option, keyTime: time, deliberate: deliberate) {
                     var flags: CGEventFlags = .maskCommand
                     if shift {
                         flags.insert(.maskShift)
@@ -487,7 +876,7 @@ final class PointerInterceptor {
         case ("V", 3):
             return .paste(shift: true, option: true)
         default:
-            // ⌥⌘V 是"粘贴样式"（TextEdit、Pages），也是 Finder 的"移动到这里"
+            // ⌥⌘V 是"粘贴样式"（TextEdit、Pages），也是 Finder 的"移动到这里"（它自己读剪贴板上的文件，见 readsClipboardItself）
             return nil
         }
     }
@@ -668,13 +1057,18 @@ final class PointerInterceptor {
 
     // MARK: 辅助
 
-    // 拿着键盘焦点的 App（可能是不激活自身的浮动面板）
+    // 拿着键盘焦点的 App（可能是不激活自身的浮动面板）。系统查不到时（例如 Brave 在最前面时有时报 kAXErrorNoValue）
+    // 和 focusedTarget() 一样退回前台 App：否则它自己菜单栏、右键菜单里的"拷贝"会被当成别的 App 的菜单，照常执行、经过系统剪贴板。
+    // 在 tap 线程上调用：用 runningApplications（可以在后台线程读），不用 frontmostApplication
     private static func focusedApplication() -> (pid: pid_t?, element: AXUIElement?) {
-        guard let application = asAXElement(copyAXAttribute(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute)) else {
+        if let application = asAXElement(copyAXAttribute(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute)) {
+            var pid: pid_t = 0
+            return (AXUIElementGetPid(application, &pid) == .success ? pid : nil, application)
+        }
+        guard let pid = NSWorkspace.shared.runningApplications.first(where: { $0.isActive })?.processIdentifier else {
             return (nil, nil)
         }
-        var pid: pid_t = 0
-        return (AXUIElementGetPid(application, &pid) == .success ? pid : nil, application)
+        return (pid, AXUIElementCreateApplication(pid))
     }
 
     // 网页里的文字可能在很深的层级里：往上找到窗口为止（最多 64 层）
@@ -824,10 +1218,10 @@ final class DragGuard {
         changeCountAtMouseDown = NSPasteboard(name: .drag).changeCount
         clearedSinceMouseDown = false
         // 按住选中的文字不动一会儿，NSTextView 这类控件就自己开始拖放了（不等鼠标移动，没有拖动事件；Copi 吞掉拖动事件也拦不住），
-        // 所以按住期间一直每 10 毫秒查一次，不只在拖动事件里查。最多查 60 秒
+        // 所以按住期间一直每 5 毫秒查一次，不只在拖动事件里查。最多查 60 秒
         pollTimer?.invalidate()
         let pressedAt = Date()
-        let timer = Timer(timeInterval: 0.01, repeats: true) { timer in
+        let timer = Timer(timeInterval: 0.005, repeats: true) { timer in
             guard Date().timeIntervalSince(pressedAt) < 60 else {
                 timer.invalidate()
                 return
@@ -845,10 +1239,18 @@ final class DragGuard {
         dragMoved()
     }
 
-    // 主线程：拖动中、按住鼠标期间（最多每 10 毫秒查一次）
+    // 主线程：这次按下以来拖放剪贴板变过（App 开始了拖放，包括 Copi 清掉过的）。不知道按下时的情况也算变过
+    var dragPasteboardChangedSinceMouseDown: Bool {
+        guard let before = changeCountAtMouseDown else {
+            return true
+        }
+        return NSPasteboard(name: .drag).changeCount != before
+    }
+
+    // 主线程：拖动中、按住鼠标期间（最多每 5 毫秒查一次）
     func dragMoved() {
         guard Defaults[.isOn], Defaults[.blockTextDragging], GlobalMode.shared.isProtecting,
-              let before = changeCountAtMouseDown, Date().timeIntervalSince(lastCheck) > 0.01 else {
+              let before = changeCountAtMouseDown, Date().timeIntervalSince(lastCheck) > 0.004 else {
             return
         }
         lastCheck = Date()
@@ -937,6 +1339,7 @@ final class MenuTracker {
         ) { notification in
             if let pid = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier {
                 PointerInterceptor.shared.forgetTitles(pid: pid)
+                PointerInterceptor.shared.forgetRangeMarks(pid: pid)
             }
         }
         observe(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier)

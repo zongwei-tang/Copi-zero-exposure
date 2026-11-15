@@ -28,6 +28,7 @@ import Carbon
 import ApplicationServices
 import IOKit
 import Defaults
+import KeyboardShortcuts
 import UserNotifications
 
 // MARK: - 策略
@@ -134,6 +135,9 @@ func forgetAppEngineCache(pid: pid_t) {
     typingChunkCacheLock.lock()
     typingChunkCache[pid] = nil
     typingChunkCacheLock.unlock()
+    javaAppCacheLock.lock()
+    javaAppCache[pid] = nil
+    javaAppCacheLock.unlock()
     editorDataFolderCacheLock.lock()
     editorDataFolderCache[pid] = nil
     editorDataFolderCacheLock.unlock()
@@ -160,7 +164,7 @@ private let geckoCacheLock = NSLock()
 private var geckoCache: [pid_t: Bool] = [:]
 
 // Firefox 及其各种分支（Floorp、LibreWolf、Zen、Thunderbird……）：包里都有 Gecko 的 XUL 库
-private func isGeckoApp(pid: pid_t, bundleIdentifier: String?) -> Bool {
+func isGeckoApp(pid: pid_t, bundleIdentifier: String?) -> Bool {
     if let bundleIdentifier, geckoBundleIDPrefixes.contains(where: { bundleIdentifier.hasPrefix($0) }) {
         return true
     }
@@ -217,10 +221,13 @@ func runningClipboardSyncers() -> [String] {
 
 // 主线程：退回剪贴板方式之前（每个退回的地方都要）调用，这是唯一的一道检查。有会把本机剪贴板同步出去的 App 在运行时（粘贴目标
 // 本身就是虚拟机、远程桌面也算），第一次只提醒（文字会被它们带到那台电脑的剪贴板、剪贴板历史里，粘贴完也一直留着），
-// 8 秒内用户亲手再粘贴一次才退回剪贴板
-func remoteClipboardConfirmationBeforeFallback(_ text: String, targetPID: pid_t?) -> UnavailableReason? {
+// 8 秒内用户亲手再粘贴一次才退回剪贴板。keyTime：这一次按键按下的时刻（见 PasteConfirmation）
+func remoteClipboardConfirmationBeforeFallback(_ text: String, targetPID: pid_t?, keyTime: Date) -> UnavailableReason? {
     let syncers = runningClipboardSyncers()
-    guard !syncers.isEmpty, RemoteClipboardGuard.confirmation.needsConfirmation(key: "\(targetPID ?? -1)\u{0}\(text)") else {
+    // 会把本机剪贴板同步出去的 App 和提醒时不一样了（例如确认之后才打开的虚拟机、iPhone 镜像）：用户确认时不知道有它，要重新问
+    //（同 CopyThroughAppConsent）。排好序：不能因为列出来的先后不同就每次都重新问，那样用户确认了也粘贴不了
+    let key = "\(targetPID ?? -1)\u{0}\(syncers.sorted().joined(separator: "\u{0}"))\u{0}\(text)"
+    guard !syncers.isEmpty, RemoteClipboardGuard.confirmation.needsConfirmation(key: key, keyTime: keyTime) else {
         return nil
     }
     return .remoteClipboard(syncers)
@@ -234,6 +241,18 @@ private let multiLineTypingDenyBundleIDPrefixes = [
 private let typingChunkCacheLock = NSLock()
 private var typingChunkCache: [pid_t: Int] = [:]
 
+// App 包里带着的 Java：java 是 Java 运行时或 Java 程序（jpackage 的 runtime、appbundler 的 Java、PlugIns 里的 JDK/JRE），
+// jetBrainsRuntime 是 JetBrains 自己的运行时（jbr）
+private func bundledJava(contents: URL) -> (java: Bool, jetBrainsRuntime: Bool) {
+    let fileManager = FileManager.default
+    func exists(_ path: String) -> Bool {
+        fileManager.fileExists(atPath: contents.appendingPathComponent(path).path)
+    }
+    let plugIns = (try? fileManager.contentsOfDirectory(atPath: contents.appendingPathComponent("PlugIns").path)) ?? []
+    let java = exists("runtime") || exists("Java") || plugIns.contains { $0.lowercased().contains("jdk") || $0.lowercased().contains("jre") }
+    return (java, exists("jbr"))
+}
+
 // 每个按键事件最多能带几个 UTF-16 单元：标准 OpenJDK 的 Swing 程序只取第一个字符（JetBrains 自带的运行时没有这个问题），
 // 内嵌 QtWebEngine 的程序最多留 3 个。其余（Cocoa、Chromium、WebKit、终端）整串都收
 private func typingChunkLimit(pid: pid_t) -> Int {
@@ -245,15 +264,10 @@ private func typingChunkLimit(pid: pid_t) -> Int {
     }
     var limit = KeystrokeTyper.chunkLimit
     if let contents = NSRunningApplication(processIdentifier: pid)?.bundleURL?.appendingPathComponent("Contents") {
-        let fileManager = FileManager.default
-        func exists(_ path: String) -> Bool {
-            fileManager.fileExists(atPath: contents.appendingPathComponent(path).path)
-        }
-        let plugIns = (try? fileManager.contentsOfDirectory(atPath: contents.appendingPathComponent("PlugIns").path)) ?? []
-        let bundlesJava = exists("runtime") || exists("Java") || plugIns.contains { $0.lowercased().contains("jdk") || $0.lowercased().contains("jre") }
-        if bundlesJava, !exists("jbr") {
+        let bundled = bundledJava(contents: contents)
+        if bundled.java, !bundled.jetBrainsRuntime {
             limit = 1
-        } else if exists("Frameworks/QtWebEngineCore.framework") {
+        } else if FileManager.default.fileExists(atPath: contents.appendingPathComponent("Frameworks/QtWebEngineCore.framework").path) {
             limit = 1
         }
     }
@@ -263,11 +277,68 @@ private func typingChunkLimit(pid: pid_t) -> Int {
     return limit
 }
 
+private let javaAppCacheLock = NSLock()
+private var javaAppCache: [pid_t: Bool] = [:]
+
+// 界面是 Java（Swing、AWT）写的 App：包里带着 Java（包括 JetBrains 的运行时），或者进程本身就是 java 命令
+// （java -jar 启动、没有自己的 App 包）
+private func isJavaApp(pid: pid_t) -> Bool {
+    javaAppCacheLock.lock()
+    let cached = javaAppCache[pid]
+    javaAppCacheLock.unlock()
+    if let cached {
+        return cached
+    }
+    var isJava = false
+    if let app = NSRunningApplication(processIdentifier: pid) {
+        if let contents = app.bundleURL?.appendingPathComponent("Contents") {
+            let bundled = bundledJava(contents: contents)
+            isJava = bundled.java || bundled.jetBrainsRuntime
+        }
+        if app.executableURL?.lastPathComponent == "java" {
+            isJava = true
+        }
+    }
+    javaAppCacheLock.lock()
+    javaAppCache[pid] = isJava
+    javaAppCacheLock.unlock()
+    return isJava
+}
+
 let fileManagerBundleIDs: Set<String> = ["com.apple.finder", "com.binarynights.ForkLift", "com.cocoatech.PathFinder", "com.marta.Marta"]
 
 // JetBrains 系 IDE：编辑器在 Java 事件线程上异步应用 Accessibility 写入，没法确认；逐字处理键入（自动补全括号引号），
 // 只能键入不会触发自动补全的单行文字（见 isSafeForCodeEditor）
 private let javaIDEBundleIDPrefixes = ["com.jetbrains.", "com.google.android.studio"]
+
+private let intelliJAppCacheLock = NSLock()
+private var intelliJAppCache: [pid_t: Bool] = [:]
+
+// 基于 IntelliJ 平台的 IDE：JetBrains、Android Studio，以及别家用同一平台做的（华为 DevEco Studio 之类，bundle ID 不同）。
+// 后者认法：包里带着 JetBrains 的运行时（Contents/jbr），Resources/product-info.json 里写着自己的配置目录名（dataDirectoryName）
+func isIntelliJPlatformApp(pid: pid_t, bundleID: String?) -> Bool {
+    if let bundleID, javaIDEBundleIDPrefixes.contains(where: { bundleID.hasPrefix($0) }) {
+        return true
+    }
+    intelliJAppCacheLock.lock()
+    let cached = intelliJAppCache[pid]
+    intelliJAppCacheLock.unlock()
+    if let cached {
+        return cached
+    }
+    var result = false
+    if let contents = NSRunningApplication(processIdentifier: pid)?.bundleURL?.appendingPathComponent("Contents"),
+       FileManager.default.fileExists(atPath: contents.appendingPathComponent("jbr").path),
+       let data = try? Data(contentsOf: contents.appendingPathComponent("Resources/product-info.json")),
+       let info = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+       let directory = info["dataDirectoryName"] as? String, !directory.isEmpty {
+        result = true
+    }
+    intelliJAppCacheLock.lock()
+    intelliJAppCache[pid] = result
+    intelliJAppCacheLock.unlock()
+    return result
+}
 
 // VS Code 系编辑器（Electron）：编辑器本身是 Monaco（靠 AXDOMClassList 认出来，按代码编辑器处理），搜索框、命令面板这些普通输入框
 // 照常走 Chromium 的路径。无障碍树还没建好、认不出是什么的时候不要乱写（编辑器的输入框是个代理节点，写进去没用）
@@ -295,8 +366,18 @@ private let wordProcessorClassNames: Set<String> = [
 // Google Sheets 的单元格编辑框：可以键入，但单元格里换行要按 ⌘↩（↩、⇧↩ 会确认单元格并跳到别的格）
 private let spreadsheetClassNames: Set<String> = ["cell-input"]
 
-// Google Docs、Sheets、Slides 也按网址认（Firefox 不提供 AXDOMClassList）
-private let wordProcessorHosts: Set<String> = ["docs.google.com"]
+// Google Docs、Sheets、Slides 也按网址认（Firefox 不提供 AXDOMClassList）。只认编辑页（docs.google.com/<种类>/[u/N/]d/<id>/…）：
+// 表单、发布出来的网页（/pub）、简化版（/mobilebasic）、只读的 htmlview 都是普通网页，照常复制粘贴
+func isGoogleEditorPage(_ url: URL?) -> Bool {
+    guard let url, url.host?.lowercased() == "docs.google.com" else {
+        return false
+    }
+    let path = url.path
+    guard path.range(of: #"^/(document|spreadsheets|presentation|drawings)/(u/\d+/)?d/[^/]+"#, options: .regularExpression) != nil else {
+        return false
+    }
+    return path.range(of: #"/(pub|pubhtml|mobilebasic|htmlview|export)(/|$)"#, options: .regularExpression) == nil
+}
 
 // ⇧↩ 确定是换行（而不是发送、确认单元格、运行代码）的地方：只有这些 App、网页的富文本编辑器才用 ⇧↩ 键入多行文字。
 // 普通的 <textarea> 里 ⇧↩ 也是换行（浏览器的默认行为）
@@ -308,14 +389,14 @@ private let softNewlineBundleIDPrefixes = [
 private let softNewlineHosts: Set<String> = [
     "mail.google.com", "app.slack.com", "discord.com", "teams.microsoft.com", "teams.live.com", "www.notion.so", "notion.so",
     "claude.ai", "chatgpt.com", "chat.openai.com", "gemini.google.com", "web.whatsapp.com", "web.telegram.org",
-    "outlook.office.com", "outlook.office365.com", "outlook.live.com", "www.messenger.com", "app.element.io", "linear.app",
+    "outlook.office.com", "outlook.office365.com", "outlook.live.com", "teams.cloud.microsoft", "outlook.cloud.microsoft", "www.messenger.com", "app.element.io", "linear.app",
     "github.com", "gitlab.com",
 ]
 
 // Firefox 里认不出代码编辑器（没有 AXDOMClassList），只对没有代码编辑器的纯聊天、邮件网站按富文本处理
 private let geckoRichTextHosts: Set<String> = [
     "mail.google.com", "app.slack.com", "discord.com", "teams.microsoft.com", "teams.live.com", "web.whatsapp.com",
-    "web.telegram.org", "outlook.office.com", "outlook.office365.com", "outlook.live.com", "www.messenger.com", "app.element.io",
+    "web.telegram.org", "outlook.office.com", "outlook.office365.com", "outlook.live.com", "teams.cloud.microsoft", "outlook.cloud.microsoft", "www.messenger.com", "app.element.io",
 ]
 
 // JetBrains 终端工具窗口的名字（各种界面语言）
@@ -347,7 +428,7 @@ let terminalPromptPrograms: Set<String> = [
     "sudo", "su", "doas", "login", "passwd",
 ]
 // 这两个终端的窗口标题总是显示当前标签页前台正在运行的程序
-private let jobTitleTerminalBundleIDs: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
+let jobTitleTerminalBundleIDs: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
 
 // 终端前台进程组里的一个进程
 struct ForegroundProcess {
@@ -360,14 +441,101 @@ struct ForegroundProcess {
 // 提示符前的程序里真正的 shell（不算在等密码的 sudo 这类）
 let terminalPasswordPrograms: Set<String> = ["sudo", "su", "doas", "login", "passwd"]
 
-// 前台进程组里的这个进程停在提示符前：shell；或者 sudo 这类程序、并且终端正处在读密码的状态（关了回显、开着 canonical 模式）。
+// 前台进程组里的这个进程停在提示符前：交互式的 shell；或者 sudo 这类程序、并且终端正处在读密码的状态（关了回显、开着 canonical 模式）。
 // sudo 这类程序认证之后会运行别的命令：新版 sudo 默认（use_pty）把命令放在另一个伪终端上，这个终端的前台组里只剩 sudo，
 // 它把终端设成 raw 模式转发按键——这时键入的文字会到达 sudo 运行的程序（例如 `sudo vim` 的普通模式，字母就是命令）
 func isAtPrompt(_ process: ForegroundProcess) -> Bool {
     guard terminalPromptPrograms.contains(process.name) else {
         return false
     }
-    return !terminalPasswordPrograms.contains(process.name) || passwordIsBeingRead(tty: process.tty)
+    if terminalPasswordPrograms.contains(process.name) {
+        return passwordIsBeingRead(tty: process.tty)
+    }
+    return shellIsInteractive(process)
+}
+
+// 各个 shell 启动参数的写法。commandFlags、commandOptions：让 shell 运行参数里给的命令（-c），或者从标准输入读命令（-s：
+// `curl … | bash -s` 里 curl 结束之后前台只剩 bash；不带 -s 的 `curl … | bash`、`bash < install.sh` 由 shellIsInteractive
+// 看标准输入是不是终端来判断）；fish 的长选项认缩写。valueFlags、valueOptions：后面跟着一个值（不是脚本）
+private struct ShellArgumentSyntax {
+    var commandFlags: Set<Character> = ["c", "s"]
+    var commandOptions: [String] = []
+    var valueFlags: Set<Character> = []
+    var valueOptions: Set<String> = []
+}
+
+private let shellArgumentSyntaxes: [String: ShellArgumentSyntax] = [
+    "bash": ShellArgumentSyntax(valueFlags: ["o", "O"], valueOptions: ["--rcfile", "--init-file"]),
+    "zsh": ShellArgumentSyntax(valueFlags: ["o"]),
+    "sh": ShellArgumentSyntax(valueFlags: ["o"]),
+    "dash": ShellArgumentSyntax(valueFlags: ["o"]),
+    "ksh": ShellArgumentSyntax(valueFlags: ["o"]),
+    // -t：读一行、执行完就退出
+    "tcsh": ShellArgumentSyntax(commandFlags: ["c", "s", "t"]),
+    "csh": ShellArgumentSyntax(commandFlags: ["c", "s", "t"]),
+    "fish": ShellArgumentSyntax(commandFlags: ["c"], commandOptions: ["--command"], valueFlags: ["C", "d", "D", "f", "o", "p"],
+                                valueOptions: ["--init-command", "--debug", "--debug-stack-frames", "--features", "--debug-output",
+                                               "--profile", "--profile-startup"]),
+]
+
+// 从启动参数和标准输入看 shell 是不是交互式的（在提示符前读用户输入）。运行脚本文件（bash script.sh、开头是 #!/bin/bash 的脚本）、
+// -c 给的命令的 shell 不是：脚本只用内建命令（read 之类）时前台组里只有它自己，看起来和停在提示符前一样，键入的文字会落到
+// 脚本接下来读的地方。登录 shell（argv[0] 以 "-" 开头）、-i、-l、不带参数的都是；脚本、-c 和 -i 一起出现时按不是处理。
+// 参数看起来是交互式的，标准输入（fd 0）也得是它的控制终端：`curl … | bash`、`bash < install.sh` 的参数和提示符前的 shell
+// 一样，命令却从管道、文件读，curl 结束之后前台只剩 bash，键入的文字会落到脚本从终端读的地方（read … < /dev/tty）。
+// 读不到参数（别的用户的进程，例如 su 打开的 root shell）或标准输入、标准输入是管道或普通文件时按不是处理；
+// 没列出写法的 shell（nu、pwsh……）这两样都不看
+private func shellIsInteractive(_ process: ForegroundProcess) -> Bool {
+    guard let syntax = shellArgumentSyntaxes[process.name] else {
+        return true
+    }
+    guard let arguments = processArguments(pid: process.pid), !arguments.isEmpty, standardInputIsTerminal(process) else {
+        return false
+    }
+    var index = 1
+    while index < arguments.count {
+        let argument = arguments[index]
+        index += 1
+        // "--" 或单独的 "-"：选项到此为止，后面还有参数就是脚本
+        if argument == "--" || argument == "-" {
+            return index >= arguments.count
+        }
+        // 第一个不是选项的参数：脚本文件
+        guard argument.count > 1, argument.hasPrefix("-") || argument.hasPrefix("+") else {
+            return false
+        }
+        // 长选项（zsh 用 "+-" 关掉）
+        if argument.hasPrefix("--") || argument.hasPrefix("+-") {
+            let name = "--" + String(argument.dropFirst(2).prefix { $0 != "=" })
+            if syntax.commandOptions.contains(where: { $0.hasPrefix(name) }) {
+                return false
+            }
+            if syntax.valueOptions.contains(name), !argument.contains("=") {
+                index += 1
+            }
+            continue
+        }
+        // 几个单字母选项写在一起（-il、-eo pipefail）。带值的选项在最后时值是下一个参数，不在最后时值紧跟在它后面（zsh、fish：-ovi）
+        let flags = argument.dropFirst()
+        if flags.contains(where: { syntax.commandFlags.contains($0) }) {
+            return false
+        }
+        if let last = flags.last, syntax.valueFlags.contains(last) {
+            index += 1
+        }
+    }
+    return true
+}
+
+// 进程的标准输入（fd 0）是它的控制终端。读不到（别的用户的进程）、是管道或 socket（不是 vnode，读不到）、普通文件时为 false
+private func standardInputIsTerminal(_ process: ForegroundProcess) -> Bool {
+    var info = vnode_fdinfowithpath()
+    let size = Int32(MemoryLayout<vnode_fdinfowithpath>.stride)
+    guard proc_pidfdinfo(process.pid, 0, PROC_PIDFDVNODEPATHINFO, &info, size) == size else {
+        return false
+    }
+    let status = info.pvip.vip_vi.vi_stat
+    return (status.vst_mode & S_IFMT) == S_IFCHR && Int32(bitPattern: status.vst_rdev) == process.tty
 }
 
 // 读密码（readpassphrase、getpass）时终端关掉回显、保留 canonical 模式（整行读）。sudoers 设了 pwfeedback（输入时显示星号）时
@@ -395,8 +563,8 @@ func programName(in group: [ForegroundProcess]) -> String? {
 
 private enum TerminalForeground {
     // 停在提示符前；shells：相关标签页里的 shell 进程（多行粘贴要看它们支不支持 bracketed paste、行编辑器是不是在读）。
-    // 有标签页停在 sudo 的密码提示时为空
-    case prompt(shells: [ForegroundProcess])
+    // 有标签页停在 sudo 的密码提示时为空。ttys：相关标签页的终端（单行放不放得下，见 canonicalLineRefusal）
+    case prompt(shells: [ForegroundProcess], ttys: [Int32])
     // 别的程序（认不出时为 nil）
     case other(String?)
 }
@@ -576,8 +744,15 @@ func terminalForegroundGroups(of target: FocusedTarget) -> [[ForegroundProcess]]
     return groups
 }
 
+// iTerm2 里开着 tmux 整合（tmux -CC）：某个标签页的前台是控制模式的 tmux 客户端（见 TmuxPaste.isControlModeClient）。整合开出来的
+// 标签页不是本机的终端，进程树里没有它们，从进程看不出焦点在不在其中一个上。读不到进程时为 false（调用方照常按认不出处理）
+func iTermTmuxIntegrationIsRunning(pid: pid_t) -> Bool {
+    let groups = terminalForegroundGroups(pid: pid, bundleID: TerminalScript.iTerm2.bundleIdentifier) ?? []
+    return groups.contains { $0.contains(where: TmuxPaste.isControlModeClient) }
+}
+
 // 本机全部进程；读不到时为 nil
-private func allProcesses() -> [kinfo_proc]? {
+func allProcesses() -> [kinfo_proc]? {
     var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
     var size = 0
     guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0, size > 0 else {
@@ -601,12 +776,13 @@ enum TerminalDelivery {
 }
 
 // 一次写进终端的内容（编辑器扩展的 sendText、iTerm2 的 write text）。shells：前台进程组里的 shell；atPasswordPrompt：组里还有
-// sudo 这类在等密码的程序。
+// sudo 这类在等密码的程序；ttys：这个组所在的终端。
 //  - shell 的行编辑器正在读、认得 bracketed paste：和真正的粘贴一样包上 ESC[200~ … ESC[201~（shell 整段插入编辑缓冲区、不执行）。
 //    单行文字也包上：vi 模式的命令模式里，原样送进去的字母是命令；
 //  - 否则（密码提示、脚本里的 read、还在启动的 shell、不认得这个标记的 shell）只原样送不含控制字符的单行文字（去掉末尾的换行——
-//    真正的粘贴也不会因为它执行命令），并且 shell 不能开着 vi 模式
-func terminalPayload(for text: String, shells: [ForegroundProcess], atPasswordPrompt: Bool) -> Result<String, UnavailableReason> {
+//    真正的粘贴也不会因为它执行命令），并且 shell 不能开着 vi 模式、不能在等单个按键，终端按行收输入时这一行还要放得下
+//    （见 canonicalLineRefusal）
+func terminalPayload(for text: String, shells: [ForegroundProcess], atPasswordPrompt: Bool, ttys: [Int32]) -> Result<String, UnavailableReason> {
     var body = KeystrokeTyper.normalizedNewlines(text)
     while body.hasSuffix("\n") {
         body.removeLast()
@@ -617,7 +793,13 @@ func terminalPayload(for text: String, shells: [ForegroundProcess], atPasswordPr
     let hasControls = body.unicodeScalars.contains { $0.properties.generalCategory == .control }
     // 密码提示：标记会成为密码的一部分
     if atPasswordPrompt || shells.isEmpty {
-        return hasControls ? .failure(.multiLine) : .success(body)
+        guard !hasControls else {
+            return .failure(.multiLine)
+        }
+        if let reason = canonicalLineRefusal(body, ttys: ttys, atPasswordPrompt: true) {
+            return .failure(reason)
+        }
+        return .success(body)
     }
     if shells.allSatisfy({ shellAcceptsBracketedPaste(pid: $0.pid, delivery: .singleWrite) && lineEditorIsReading(tty: $0.tty) }) {
         guard let sanitized = sanitizedForBracketedPaste(body) else {
@@ -625,8 +807,14 @@ func terminalPayload(for text: String, shells: [ForegroundProcess], atPasswordPr
         }
         return .success("\u{1b}[200~" + sanitized + "\u{1b}[201~")
     }
+    guard !shells.contains(where: { waitsForSingleKey($0) }) else {
+        return .failure(.singleKeyPrompt)
+    }
     guard !hasControls else {
         return .failure(.multiLine)
+    }
+    if let reason = canonicalLineRefusal(body, ttys: ttys, atPasswordPrompt: false) {
+        return .failure(reason)
     }
     guard !shells.contains(where: { shellMayUseViMode(pid: $0.pid) }) else {
         return .failure(.viMode)
@@ -661,6 +849,75 @@ func lineEditorIsReading(tty: Int32) -> Bool {
         return false
     }
     return modes.c_iflag & tcflag_t(ICRNL | INLCR) != tcflag_t(ICRNL)
+}
+
+// 终端按行收输入（canonical 模式）时一行最多原样送进去多少字节。行编辑器读的时候关掉了 canonical 模式，不受影响；
+// sudo 的密码提示、脚本里的 read、没有行编辑器的 sh 读的时候，输入先攒在终端驱动的行缓冲区里，按回车才交给程序。
+// macOS 的行缓冲区只有 MAX_INPUT（1024）字节，放满之后再来的字符连同回车都被直接丢掉，程序和用户都不知道；分几次粘贴也一样，
+// 它们攒在同一行里。行里已经有的字符看不到（FIONREAD 只数按过回车的行），所以只数要送的这一行，留出余量
+let canonicalLineByteLimit = 1000
+
+// 要原样送进这些终端（ttys）的一行文字放不下时，返回拒绝的原因。atPasswordPrompt：停在 sudo 这类的密码提示，不看终端设置一律
+// 按这个上限（开着 pwfeedback 的 sudo 关掉 canonical 模式自己一个个字符读，读进的也是它自己有限的缓冲区）。
+// 读不到终端设置、不知道是哪些终端时，按会截断处理。
+// 要排在返回允许剪贴板回退的原因（canType 不通过、vi 模式等）之前查：退回剪贴板的真正粘贴一样会被截断
+func canonicalLineRefusal(_ line: String, ttys: [Int32], atPasswordPrompt: Bool) -> UnavailableReason? {
+    guard line.utf8.count > canonicalLineByteLimit,
+          atPasswordPrompt || ttys.isEmpty || ttys.contains(where: { terminalReadsWholeLines(tty: $0) }) else {
+        return nil
+    }
+    return .lineTooLong(canonicalLineByteLimit)
+}
+
+// 终端开着 canonical 模式（整行读）；读不到时也算
+private func terminalReadsWholeLines(tty: Int32) -> Bool {
+    guard let path = terminalDevicePath(tty) else {
+        return true
+    }
+    let fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK)
+    guard fd >= 0 else {
+        return true
+    }
+    defer { close(fd) }
+    var modes = termios()
+    guard tcgetattr(fd, &modes) == 0 else {
+        return true
+    }
+    return modes.c_lflag & tcflag_t(ICANON) != 0
+}
+
+// 终端上在等单个按键：zsh 的 read -q、read -k（oh-my-zsh 启动时问要不要更新就是这样），bash 的 read -n 1。它们关掉 canonical 模式
+// 一个个字符读，读的却不是 shell 的行编辑器（见 lineEditorIsReading）：原样送进去的第一个字符就是回答，后面的字符落到之后运行的
+// 东西里。读不到终端设置时也按在等处理。
+// 只看 zsh、bash、sh（macOS 上的 sh 是 bash、zsh 或 dash）：只看终端设置分不出别的 shell 的行编辑器在读——elvish 的行编辑器在
+// 提示符前关掉 canonical 模式和回显、只打开 ICRNL，和 zsh 的 read -q 一模一样，按在等单个按键处理会拒绝它提示符前的每一次粘贴
+func waitsForSingleKey(_ shell: ForegroundProcess) -> Bool {
+    readsSingleKey(shell) ?? true
+}
+
+// waitsForSingleKey 的判断；读不到终端设置时为 nil
+private func readsSingleKey(_ shell: ForegroundProcess) -> Bool? {
+    guard ["zsh", "bash", "sh"].contains(shell.name) else {
+        return false
+    }
+    // 只读一次终端设置：分两次读的话，行编辑器正好在两次之间开始读时会被当成在等单个按键
+    guard let path = terminalDevicePath(shell.tty) else {
+        return nil
+    }
+    let fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK)
+    guard fd >= 0 else {
+        return nil
+    }
+    defer { close(fd) }
+    var modes = termios()
+    guard tcgetattr(fd, &modes) == 0 else {
+        return nil
+    }
+    // 行编辑器在读（见 lineEditorIsReading）
+    if modes.c_lflag & tcflag_t(ICANON | ECHO) == 0, modes.c_iflag & tcflag_t(ICRNL | INLCR) != tcflag_t(ICRNL) {
+        return false
+    }
+    return modes.c_lflag & tcflag_t(ICANON) == 0
 }
 
 // 括号里的内容：换行用 \r（终端自己粘贴时也这样），Tab 保留；别的 C0 控制字符和 DEL 换成 Unicode 里对应的图形符号（ESC 变成 ␛），
@@ -760,7 +1017,7 @@ func shellAcceptsBracketedPaste(pid: pid_t, delivery: TerminalDelivery) -> Bool 
         return false
     }
     let resolved = URL(fileURLWithPath: executable).resolvingSymlinksInPath().path
-    let environment = processEnvironment(pid: pid) ?? [:]
+    let environment = shellEnvironment(pid: pid)
     switch URL(fileURLWithPath: resolved).lastPathComponent {
     case "zsh":
         guard let files = zshConfigFiles(environment: environment), !configFilesMention(files, ["200~"]) else {
@@ -786,7 +1043,7 @@ func shellEnablesBracketedPasteMode(pid: pid_t) -> Bool {
         return false
     }
     let resolved = URL(fileURLWithPath: executable).resolvingSymlinksInPath().path
-    let environment = processEnvironment(pid: pid) ?? [:]
+    let environment = shellEnvironment(pid: pid)
     switch URL(fileURLWithPath: resolved).lastPathComponent {
     case "zsh":
         guard let files = zshConfigFiles(environment: environment) else {
@@ -812,7 +1069,7 @@ func shellMayUseViMode(pid: pid_t) -> Bool {
         return true
     }
     let resolved = URL(fileURLWithPath: executable).resolvingSymlinksInPath().path
-    let environment = processEnvironment(pid: pid) ?? [:]
+    let environment = shellEnvironment(pid: pid)
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     switch URL(fileURLWithPath: resolved).lastPathComponent {
     case "zsh":
@@ -835,6 +1092,28 @@ func shellMayUseViMode(pid: pid_t) -> Bool {
     default:
         return false
     }
+}
+
+// fish 不认键入的 bracketed paste 时（见 shellAcceptsBracketedPaste）Copi 原样键入，键入的空格、; | & < > ) 会把前面的缩写（abbr）
+// 展开成别的命令；真正的粘贴原样插入。配置里提到 abbr（config.fish、conf.d、functions、旧版存在 fish_variables 里的）、
+// 这一行里又有会触发展开的字符时返回 true。读不到可执行文件时按是处理
+func fishMayExpandAbbreviation(pid: pid_t, line: String) -> Bool {
+    guard line.contains(where: { " ;|&<>)".contains($0) }) else {
+        return false
+    }
+    guard let executable = processExecutablePath(pid: pid) else {
+        return true
+    }
+    guard URL(fileURLWithPath: executable).resolvingSymlinksInPath().lastPathComponent == "fish" else {
+        return false
+    }
+    let environment = shellEnvironment(pid: pid)
+    let config = environment["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.config"
+    var files = [config + "/fish/config.fish", config + "/fish/fish_variables"]
+    for directory in ["/fish/conf.d", "/fish/functions"] {
+        files += ((try? FileManager.default.contentsOfDirectory(atPath: config + directory)) ?? []).map { config + directory + "/" + $0 }
+    }
+    return configFilesMention(files, ["abbr"])
 }
 
 // 配置文件里有一行匹配这个正则
@@ -885,7 +1164,13 @@ func bashVersion(executable path: String) -> (major: Int, minor: Int)? {
     return version
 }
 
-// 进程的环境变量（只能读同一用户的进程）；读不到时为 nil
+// shell（或 tmux）的环境变量，Copi 从里面看 EDITOR、ZDOTDIR、XDG_CONFIG_HOME 这几个。macOS 27 起读别的进程只拿得到参数、
+// 拿不到环境变量：这时用 Copi 自己的。从登录时的 launchd 继承来的（launchctl setenv 设的）两边一样，在配置文件里设的另外从配置文件里找
+func shellEnvironment(pid: pid_t) -> [String: String] {
+    processEnvironment(pid: pid) ?? ProcessInfo.processInfo.environment
+}
+
+// 进程的环境变量（只能读同一用户的进程）；读不到时为 nil。一个也没有也算读不到：真正运行着的 shell 总有 HOME、PATH 这些
 func processEnvironment(pid: pid_t) -> [String: String]? {
     var argumentLimit: Int32 = 0
     var limitSize = MemoryLayout<Int32>.size
@@ -933,7 +1218,7 @@ func processEnvironment(pid: pid_t) -> [String: String]? {
         }
         index += 1
     }
-    return environment
+    return environment.isEmpty ? nil : environment
 }
 
 // 进程的程序文件路径
@@ -975,7 +1260,36 @@ func foregroundGroup(ofTerminalDevice path: String) -> [ForegroundProcess]? {
     return members.isEmpty ? nil : members
 }
 
-private func processName(_ process: kinfo_proc) -> String {
+// 进程的子孙里有没有控制终端是另一个终端设备的：Vim 的 :terminal、Neovim 的终端窗口在自己开的伪终端上运行程序（Neovim 0.10 起
+// 是它的 --embed 子进程开的），那个伪终端就是程序的控制终端。没有控制终端的子孙（插件、语言服务器经管道运行的）不算，已经退出的不算。
+// 读不到进程表、这个进程已经不在时为 nil
+func hasDescendantOnOtherTerminal(_ process: ForegroundProcess) -> Bool? {
+    guard let processes = allProcesses(),
+          processes.contains(where: { $0.kp_proc.p_pid == process.pid && $0.kp_eproc.e_tdev == process.tty }) else {
+        return nil
+    }
+    var childIndexes: [pid_t: [Int]] = [:]
+    for (index, entry) in processes.enumerated() {
+        childIndexes[entry.kp_eproc.e_ppid, default: []].append(index)
+    }
+    var pending = [process.pid]
+    var visited = Set<pid_t>()
+    while let current = pending.popLast() {
+        guard visited.insert(current).inserted else {
+            continue
+        }
+        for index in childIndexes[current] ?? [] {
+            let child = processes[index]
+            if child.kp_proc.p_stat != CChar(SZOMB), child.kp_eproc.e_tdev != -1, child.kp_eproc.e_tdev != process.tty {
+                return true
+            }
+            pending.append(child.kp_proc.p_pid)
+        }
+    }
+    return false
+}
+
+func processName(_ process: kinfo_proc) -> String {
     var command = process.kp_proc.p_comm
     return withUnsafeBytes(of: &command) { raw in
         String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
@@ -1063,7 +1377,9 @@ extension FocusedTarget {
                 guard let label = copyAXAttribute(element, attribute) as? String else {
                     continue
                 }
-                if label.localizedCaseInsensitiveContains("terminal") {
+                // VS Code 网页版等把 "Terminal input" 译成界面语言（"终端输入"、"ターミナル入力"……）
+                let lowered = label.lowercased()
+                if label.localizedCaseInsensitiveContains("terminal") || ideTerminalLabels.contains(where: { lowered.contains($0) }) {
                     return .terminal
                 }
                 if label.caseInsensitiveCompare("editor") == .orderedSame || label.hasPrefix("Editor content") {
@@ -1071,8 +1387,8 @@ extension FocusedTarget {
                 }
             }
             if let url = webPageURL, let host = url.host?.lowercased() {
-                // Firefox 认不出 Google Sheets 的单元格编辑框（没有 class），整个网站按文字处理器拒绝
-                if wordProcessorHosts.contains(host) {
+                // Firefox 认不出 Google Sheets 的单元格编辑框（没有 class），Docs、Sheets、Slides 的编辑页都按文字处理器拒绝
+                if isGoogleEditorPage(url) {
                     return .wordProcessor
                 }
                 if geckoRichTextHosts.contains(host) {
@@ -1115,7 +1431,7 @@ extension FocusedTarget {
         }
         // Google Docs 的键盘输入在一个 about:blank 的 iframe 里，那里够不着外面的 class：再按网址认一遍
         // 只有真的找到了单元格编辑框才算电子表格（评论框、查找框、对话框里的 ⌘↩ 是提交）
-        guard let host = webPageHost, wordProcessorHosts.contains(host) else {
+        guard isGoogleEditorPage(webPageURL) else {
             return nil
         }
         return .wordProcessor
@@ -1159,23 +1475,25 @@ extension FocusedTarget {
     // 在这里 ⇧↩ 是不是换行（见 softNewlineBundleIDPrefixes）：原生的多行文本视图、已知的聊天和邮件 App、网页。
     // 别的网页里认不出：网页电子表格的编辑框、搜索框（Google 的搜索框就是 <textarea>）里 ⇧↩ 会确认、提交
     func shiftReturnIsSoftNewline(engine: WebEngine?) -> Bool {
+        // Java（Swing）的文本区：⇧↩ 什么都不插入，多行文字会被连成一行。它的选中文字也可以直接改写，下面的办法认不出来。
+        // 这里多行文字只通过 Accessibility 写入，写不进去就拒绝，不键入
+        if isJavaApp(pid: pid) {
+            return false
+        }
         if let bundleID = bundleIdentifier, softNewlineBundleIDPrefixes.contains(where: { bundleID.hasPrefix($0) }) {
             return true
         }
         guard engine != nil else {
             // 原生的多行文本视图（AppKit 的 NSTextView）：⇧↩ 和 ↩ 一样插入换行。认得出它的办法是选中的文字可以直接改写
-            // （AXSelectedText 可写）：Qt、Tk、Java 这些界面库只让改整段值，它们的 ⇧↩ 可能是别的意思（Jupyter QtConsole、Spyder
-            // 的 ⇧↩ 是运行代码）。认不出引擎的网页节点也不算
+            // （AXSelectedText 可写）：Qt、Tk 这些界面库只让改整段值，它们的 ⇧↩ 可能是别的意思（Jupyter QtConsole、Spyder
+            // 的 ⇧↩ 是运行代码）；Java 在上面单独排除。认不出引擎的网页节点也不算
             return !hasWebAreaAncestor && isSettable(kAXSelectedTextAttribute)
         }
         return webPageHost.map { softNewlineHosts.contains($0) } ?? false
     }
 
     var isJavaIDE: Bool {
-        guard let bundleID = bundleIdentifier else {
-            return false
-        }
-        return javaIDEBundleIDPrefixes.contains { bundleID.hasPrefix($0) }
+        isIntelliJPlatformApp(pid: pid, bundleID: bundleIdentifier)
     }
 
     var isElectronCodeEditorApp: Bool {
@@ -1248,12 +1566,26 @@ extension FocusedTarget {
         return .unknown
     }
 
-    // 可编辑的文字控件（⌘X 删除选中内容、模拟键入的前提）：只读的文本视图、Emacs/Vim 这类模态编辑器里键入的字符会被当成命令
+    // 可编辑的文字控件（⌘X 删除选中内容、模拟键入的前提）：只读的文本视图、Emacs/Vim 这类模态编辑器里键入的字符会被当成命令。
+    // 终端 App 只排除终端画面（Emacs/Vim 可能在里面），它自己的输入框（iTerm2 的 Composer、查找框）照常算
     var isEditableTextControl: Bool {
-        guard !isSecureTextField, let role, axWritableRoles.contains(role), !isTerminalApp else {
+        guard !isSecureTextField, let role, axWritableRoles.contains(role), !(isTerminalApp && isTerminalSurface) else {
             return false
         }
         return isSettable(kAXSelectedTextAttribute) || isSettable(kAXValueAttribute)
+    }
+
+    // 宽不到 40 点或高不到 8 点的多行输入框：网页里接收按键的隐藏输入框（xterm.js 的在屏幕外、0×0，Monaco 约 1 点宽，
+    // 跟着光标走的也只有一个字符宽），不是用户看得见的输入框。读不到大小时不算
+    var isTinyHiddenInput: Bool {
+        guard role == kAXTextAreaRole, let raw = copyAXAttribute(element, kAXSizeAttribute), CFGetTypeID(raw) == AXValueGetTypeID() else {
+            return false
+        }
+        var size = CGSize.zero
+        guard AXValueGetValue(raw as! AXValue, .cgSize, &size) else {
+            return false
+        }
+        return size.width < 40 || size.height < 8
     }
 
     // Firefox 的 <input>/<textarea>（不是 contenteditable）：单行输入框，或者没有子节点、只有一个文字节点的多行输入区。
@@ -1293,6 +1625,12 @@ extension FocusedTarget {
     // 选中了不止一段（⌘-拖选出的多段、多光标）：选中文字只给第一段，按一次退格却会把每一段都删掉
     var hasMultipleSelections: Bool {
         (copyAXAttribute(element, "AXSelectedTextRanges") as? [Any]).map { $0.count > 1 } ?? false
+    }
+
+    // Firefox 系的 App 不提供 AXSelectedTextRanges，看不出选了几段：用 ⌘ 添过选区、之后没在那里点过文字的地方算作选了多段
+    // （见 PointerInterceptor.mayHaveSeveralGeckoRanges）
+    var mayHaveUnlistedSelections: Bool {
+        isGeckoApp(pid: pid, bundleIdentifier: bundleIdentifier) && PointerInterceptor.shared.mayHaveSeveralGeckoRanges(focus: element, pid: pid)
     }
 
     // 选了多段时按位置顺序读出每一段（和原生文本视图自己的"拷贝"一样连起来）；有一段读不出来就返回 nil
@@ -1364,14 +1702,13 @@ extension FocusedTarget {
             return shells
         }
         let promptGroups = groups.filter(isPrompt)
-        if promptGroups.count == groups.count {
-            return .prompt(shells: shells(in: groups))
-        }
-        let title = focusedWindowTitle
-        // 别的标签页在运行程序：看标题里单独成段的当前程序名，并且它正好是某个停在提示符前的标签页里的 shell，才算当前标签页在提示符前。
+        // 标题里单独成段的当前程序名正好是某些停在提示符前的标签页里的 shell：当前标签页就是其中之一。
         // Terminal 在提示符前显示的是登录 shell 的 "-zsh"（"目录 — -zsh — 80×24"），要求带上这个 "-"，免得把叫 zsh 的目录名当成程序；
         // iTerm2 显示 "zsh" 或 "Default (zsh)"
-        if let title, let bundleID = bundleIdentifier, jobTitleTerminalBundleIDs.contains(bundleID) {
+        let titleMatching = { () -> [[ForegroundProcess]] in
+            guard let title = self.focusedWindowTitle, let bundleID = self.bundleIdentifier, jobTitleTerminalBundleIDs.contains(bundleID) else {
+                return []
+            }
             let components = title.components(separatedBy: CharacterSet(charactersIn: "—()"))
                 .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
             let requiresLoginDash = bundleID == "com.apple.Terminal"
@@ -1381,10 +1718,30 @@ extension FocusedTarget {
                 }
                 return requiresLoginDash ? nil : component
             })
-            let matching = promptGroups.filter { group in group.contains { named.contains($0.name) } }
-            if !matching.isEmpty {
-                return .prompt(shells: shells(in: matching))
+            // 标题里的名字也是没停在提示符前的标签页里的程序：分不出当前是哪个标签页，不收窄。iTerm2 对运行脚本的 zsh
+            // （zsh ./setup.zsh）和提示符前的 zsh 都显示 "zsh"；Terminal 只有登录 shell 显示 "-zsh"。这个 "-" 来自启动参数：
+            // 别的用户的 shell（su、sudo -s 打开的 root shell）的启动参数 Terminal 和 Copi 一样读不出，不会这样显示
+            let ambiguous = groups.contains { group in
+                !isPrompt(group) && group.contains { process in
+                    named.contains(process.name) && (!requiresLoginDash || processArguments(pid: process.pid)?.first?.hasPrefix("-") == true)
+                }
             }
+            if ambiguous {
+                return []
+            }
+            return promptGroups.filter { group in group.contains { named.contains($0.name) } }
+        }
+        if promptGroups.count == groups.count {
+            // 都在提示符前：标题指明了当前标签页的 shell 时只看那几个标签页（别的标签页里不认 bracketed paste 的老 shell、
+            // 在等密码的 sudo 不该挡住这一个）
+            let matching = groups.count > 1 ? titleMatching() : []
+            let chosen = matching.isEmpty ? groups : matching
+            return .prompt(shells: shells(in: chosen), ttys: chosen.compactMap { $0.first?.tty })
+        }
+        // 别的标签页在运行程序：标题指明了当前标签页的 shell，才算当前标签页在提示符前
+        let matching = titleMatching()
+        if !matching.isEmpty {
+            return .prompt(shells: shells(in: matching), ttys: matching.compactMap { $0.first?.tty })
         }
         let other = groups.first { !isPrompt($0) }.flatMap(programName)
         return .other(other)
@@ -1514,6 +1871,8 @@ enum ZeroExposurePasteResult {
 // 没有 0 暴露办法的原因，用来告诉用户怎么办
 enum UnavailableReason: Error {
     case noRoute
+    // 终端里按行收输入的地方（sudo 的密码提示、脚本里的 read）一行放不下这么多字节（见 canonicalLineRefusal）：分几次粘贴也不行
+    case lineTooLong(Int)
     // 只能一行一行地键入（终端、代码编辑器、认不出 ⇧↩ 是不是换行的编辑器）
     case multiLine
     // 当前是拼音等输入法，键入的字符会被拿去组字
@@ -1522,12 +1881,18 @@ enum UnavailableReason: Error {
     case modalProgram(String?)
     // 编辑器、shell 会改掉其中的某些字符（自动补全括号引号、历史展开）
     case unsafeCharacters
+    // 富文本编辑器会把键入的某些写法变成格式（行首的 "- " 变成列表、":smile:" 变成表情）
+    case formattingTriggers
     // 虚拟机、远程桌面：有的字符没法用一个键（加 ⇧）直接打出来
     case untypeableCharacters
     // 大写锁定开着：虚拟机里打出来的大小写会反
     case capsLock
     // shell 可能开着 vi 键位，命令模式里粘贴进去的字母是命令
     case viMode
+    // fish 定义了缩写（abbr）：键入的空格、; | & 会把前面的词展开成别的命令，真正的粘贴不会
+    case shellAbbreviations
+    // 终端在等单个按键（zsh 的 read -q、bash 的 read -n 1 这类）：粘贴的第一个字符就是回答
+    case singleKeyPrompt
     // 打开了 "Don't Type When Keystrokes Are Watched"，而这些程序看得到按键（键入的文字它们都看得到）
     case keystrokesWatched([String])
     // 从网页浏览器复制的文字要粘贴进"终端"：等用户再按一次 ⌘V 确认（见 BrowserToTerminalGuard）
@@ -1539,11 +1904,17 @@ enum UnavailableReason: Error {
     case tmuxHooks([String])
     // 机密内容要粘贴进地址栏、搜索框：等用户再粘贴一次确认（见 ConcealedDestinationGuard）
     case concealedIntoSearch
+    // Copi 还在往这里键入上一次粘贴，或者上一次粘贴刚刚在这里打到一半停下（见 KeystrokeTyper.isTypingOrJustStopped）
+    case stillTyping
 
-    // 允许剪贴板回退时可不可以退回剪贴板：用户为了不让别的程序看到才拒绝键入的，剪贴板上它们（和所有 App）一样看得到
+    // 允许剪贴板回退时可不可以退回剪贴板：用户为了不让别的程序看到才拒绝键入的，剪贴板上它们（和所有 App）一样看得到；
+    // 还在键入上一次粘贴时，原生粘贴进去的文字一样会和打了一半的那段混在一起；一行太长时经过剪贴板的粘贴也一样会被终端丢掉后半截
     var allowsClipboardFallback: Bool {
         switch self {
-        case .keystrokesWatched, .needsConfirmation, .remoteClipboard, .concealedIntoSearch:
+        case .keystrokesWatched, .needsConfirmation, .remoteClipboard, .concealedIntoSearch, .stillTyping, .lineTooLong:
+            return false
+        // 在等单个按键时 shell 没打开 bracketed paste 模式：真正的粘贴一样会被第一个字符回答，退回剪贴板只多一次暴露
+        case .singleKeyPrompt:
             return false
         default:
             return true
@@ -1574,15 +1945,25 @@ func zeroExposurePaste(_ text: String, into target: FocusedTarget?, keyTime: Dat
     dispatchPrecondition(condition: .onQueue(.main))
     // 允许剪贴板回退时也先走不经过剪贴板的路线：只有这里一条路都没有（返回 .unavailable）时，调用方才退回剪贴板
     guard let target else {
+        // 读不到焦点控件：只看是哪个 App
+        if let pid = focusedApplication()?.processIdentifier,
+           KeystrokeTyper.shared.isTypingOrJustStopped(into: pid, element: nil, keyTime: keyTime) {
+            return .unavailable(.stillTyping)
+        }
         guard let passwordField = revealPasswordField(around: nil) else {
             // （读不到焦点控件的虚拟机、远程桌面：退回剪贴板之前由 remoteClipboardConfirmationBeforeFallback 先提醒）
             return .unavailable(.noRoute)
         }
         return typePassword(text, into: passwordField, keyTime: keyTime)
     }
+    // 上一次粘贴还在往这里键入，或者刚刚在这里打到一半停下：这次什么都不粘贴——不论写入、键入还是退回剪贴板，
+    // 都会和打了一半的那段混在一起。先于各种"再粘贴一次确认"的提醒：这次按键不去提醒（也就不会开始等确认）
+    if KeystrokeTyper.shared.isTypingOrJustStopped(into: target.pid, element: target.element, keyTime: keyTime) {
+        return .unavailable(.stillTyping)
+    }
     // 机密内容要粘贴进地址栏、搜索框：先提醒
     if ConcealedDestinationGuard.needsConfirmation(text, concealed: concealed ?? (SecureClipboard.shared.text == text && SecureClipboard.shared.isConcealed),
-                                                   into: target) {
+                                                   into: target, keyTime: keyTime) {
         return .unavailable(.concealedIntoSearch)
     }
     let bundleID = target.bundleIdentifier ?? ""
@@ -1698,7 +2079,7 @@ func zeroExposurePaste(_ text: String, into target: FocusedTarget?, keyTime: Dat
         }
     case .chromium:
         if isAtomic {
-            switch spliceValue(text, into: target) {
+            switch spliceValue(text, into: target, keyTime: keyTime) {
             case .inserted, .uncertain:
                 return .inserted
             case .notApplicable:
@@ -1714,9 +2095,15 @@ func zeroExposurePaste(_ text: String, into target: FocusedTarget?, keyTime: Dat
             }
         }
     case .gecko:
+        // 认不出的、几乎看不见的 <textarea>：网页终端（xterm.js）、代码编辑器（CodeMirror 5、Ace、界面语言不是英文的 Monaco）
+        // 接收按键用的隐藏输入框。整体改写值会被页面当成键入的文字转给终端（换行就是回车），键入也一样：都不做，
+        // 第二次按下经过剪贴板、由页面自己的粘贴处理（xterm 会包上 bracketed paste）
+        if case .unknown? = editorKind, target.isTinyHiddenInput {
+            return .unavailable(.noRoute)
+        }
         // Firefox 的 <input>/<textarea>：整体改写值（异步生效，写完确认）。富文本编辑区不行，只能键入
         if target.isGeckoTextControl {
-            switch spliceValue(text, into: target, byteLimit: geckoValueByteLimit) {
+            switch spliceValue(text, into: target, keyTime: keyTime, byteLimit: geckoValueByteLimit) {
             case .inserted, .uncertain:
                 return .inserted
             case .notApplicable:
@@ -1735,11 +2122,25 @@ func zeroExposurePaste(_ text: String, into target: FocusedTarget?, keyTime: Dat
         }
         return typeIntoCodeEditor(text, target: target, keyTime: keyTime)
     }
-    // 富文本编辑器（Slack、Notion、Gmail……）、多行输入框：用键入（只在 ⇧↩ 确定是换行的地方键入多行文字）
+    // 富文本编辑器（Slack、Notion、Gmail……）、多行输入框：用键入（只在 ⇧↩ 确定是换行的地方键入多行文字）。
+    // 富文本编辑区（有子元素，不是单独的 <textarea>）会把键入的 Markdown 写法、表情代码变成格式，真正的粘贴不会：这样的文字不键入
     if role == kAXTextAreaRole || target.isSettable(kAXValueAttribute) {
+        if target.childCount != 0, containsFormattingTriggers(text) {
+            return .unavailable(.formattingTriggers)
+        }
         return typeIfPossible(text, into: target, newlines: newlinePolicy(for: target, role: role, engine: engine), keyTime: keyTime)
     }
     return .unavailable(.noRoute)
+}
+
+// 富文本编辑器在键入时会变成格式的写法：行首（前面可以有空格）的标题、列表、引用、代码块、待办、分隔线，以及表情代码（:smile:）。
+// 冒号隔开的一串里、两头都紧贴着字母、数字、下划线或冒号的 :name:（ARN 的 arn:aws:s3:::bucket、IPv6、MAC 地址、std::io::Write、
+// Tailwind 的 hover:bg-red-500）不算表情代码；只要有一头不贴着就算。编辑器在打下结尾的冒号时就转换，开头贴着词的
+// great job:tada:、结尾后面还跟着字的 :smile::tada:、:thumbsup::skin-tone-2:、:smile:foo 照样会变
+func containsFormattingTriggers(_ text: String) -> Bool {
+    let lineStart = #"(?m)^[ \t]*(#{1,6} |[-*+] |> |\d{1,9}[.)] |```|~~~|\[[ xX]?\] |---|\*\*\*|___)"#
+    let emoji = #"(?<![A-Za-z0-9_:]):[A-Za-z_][A-Za-z0-9_+\-]*:|:[A-Za-z_][A-Za-z0-9_+\-]*:(?![A-Za-z0-9_:])"#
+    return text.range(of: lineStart, options: .regularExpression) != nil || text.range(of: emoji, options: .regularExpression) != nil
 }
 
 private func newlinePolicy(for target: FocusedTarget, role: String?, engine: WebEngine?) -> NewlinePolicy {
@@ -1804,6 +2205,10 @@ private func pasteIntoEditorTerminal(_ text: String, focus: EditorBridge.Focus, 
     // 看前台进程组里真正在运行的 shell（用户可能在终端里又开了一个 bash、sh）
     let group = foregroundGroup(ofProcess: shellPID)
     guard let group, !group.isEmpty, group.allSatisfy(isAtPrompt) else {
+        // 脚本在等单个按键（read -n 1）：第一个字符就是回答，第二次按下也不经过剪贴板（和别的终端一样）
+        if let group, groupWaitsForSingleKey(group) {
+            return .unavailable(.singleKeyPrompt)
+        }
         return .unavailable(.modalProgram(group.flatMap(programName)))
     }
     let shells = group.filter { !terminalPasswordPrograms.contains($0.name) }
@@ -1811,6 +2216,9 @@ private func pasteIntoEditorTerminal(_ text: String, focus: EditorBridge.Focus, 
     if shells.count < group.count {
         guard let line = singleLineWithoutTrailingNewline(text) else {
             return .unavailable(.multiLine)
+        }
+        if let reason = canonicalLineRefusal(line, ttys: group.map(\.tty), atPasswordPrompt: true) {
+            return .unavailable(reason)
         }
         guard !line.isEmpty, let role = target.role, axWritableRoles.contains(role),
               KeystrokeTyper.canType(line, maxUnitsPerCharacter: typingChunkLimit(pid: target.pid)) else {
@@ -1826,7 +2234,7 @@ private func pasteIntoEditorTerminal(_ text: String, focus: EditorBridge.Focus, 
         return .typing
     }
     let payload: String
-    switch terminalPayload(for: text, shells: shells, atPasswordPrompt: false) {
+    switch terminalPayload(for: text, shells: shells, atPasswordPrompt: false, ttys: group.map(\.tty)) {
     case .success(let value):
         payload = value
     case .failure(let reason):
@@ -1957,13 +2365,25 @@ private let remoteDesktopHostUIRoles: Set<String> = [
     kAXMenuButtonRole, kAXRadioButtonRole, kAXTabGroupRole, kAXToolbarRole, kAXMenuItemRole, kAXMenuBarItemRole,
 ]
 
+// 拿着焦点的是虚拟机、远程桌面的客户机画面（不是它们自己界面上的输入框、列表、按钮）。读不出焦点是什么时也算：
+// 客户机画面往往没有 Accessibility 信息
+func isRemoteDesktopGuestDisplay(_ target: FocusedTarget?, bundleID: String?) -> Bool {
+    guard isRemoteDesktopApp(bundleID) else {
+        return false
+    }
+    guard let role = target?.role else {
+        return true
+    }
+    return !axWritableRoles.contains(role) && !remoteDesktopHostUIRoles.contains(role)
+}
+
 // 虚拟机、远程桌面：它们把按键事件的键位换成客户机的扫描码，不认事件里带的字符。按当前（英文）键盘布局把每个字符换成键位和 ⇧，
-// 像真的按键一样逐个按下。只用单行文字（客户机里的 ↩ 会执行、提交），不超过 1000 个字符（每个键要几十毫秒）
+// 像真的按键一样逐个按下。只用单行文字（客户机里的 ↩ 会执行、提交）。每个键要几十毫秒，长的打得久，屏幕上显示进度、按 Esc 停下
 private func typeIntoRemoteDesktop(_ text: String, target: FocusedTarget, keyTime: Date) -> ZeroExposurePasteResult {
     guard let line = singleLineWithoutTrailingNewline(text) else {
         return .unavailable(.multiLine)
     }
-    guard !line.isEmpty, (line as NSString).length <= 1000 else {
+    guard !line.isEmpty else {
         return .unavailable(.noRoute)
     }
     guard !CGEventSource.flagsState(.hidSystemState).contains(.maskAlphaShift) else {
@@ -2135,12 +2555,31 @@ private func singleLineWithoutTrailingNewline(_ text: String) -> String? {
 // 终端：焦点在终端画面上时，iTerm2、Ghostty 允许 Copi 用它们的脚本接口、WezTerm、kitty（打开了远程控制）的话，把文字一次交给终端
 // （见 TerminalScript）；否则模拟键入。
 // 焦点在同一窗口里的输入框（查找框、iTerm2 的 Composer、Ghostty 的命令面板）时，只往那个输入框里键入单行文字
+// 终端 App 自己窗口里的原生控件（设置窗口的表格、勾选框，提示框的按钮）：不是终端画面，也不是输入框
+private let terminalAppControlRoles: Set<String> = [
+    kAXButtonRole, kAXCheckBoxRole, kAXRadioButtonRole, kAXPopUpButtonRole, kAXMenuButtonRole, kAXTableRole, kAXOutlineRole,
+    kAXListRole, kAXRowRole, kAXCellRole, kAXSliderRole, kAXTabGroupRole, kAXDisclosureTriangleRole, "AXRadioGroup", "AXIncrementor", "AXLink",
+]
+
 private func typeIntoTerminal(_ text: String, target: FocusedTarget, keyTime: Date) -> ZeroExposurePasteResult {
-    if let source = BrowserToTerminalGuard.unconfirmedSource(of: text, into: target) {
+    // 焦点在这种控件上时按键会选行、切换勾选框，和别的 App 里一样没有不经过剪贴板的办法
+    if let role = target.role, terminalAppControlRoles.contains(role) {
+        return .unavailable(.noRoute)
+    }
+    if let source = BrowserToTerminalGuard.unconfirmedSource(of: text, into: target, keyTime: keyTime) {
         return .unavailable(.needsConfirmation(source: source))
     }
     guard target.isTerminalSurface else {
         guard let line = singleLineWithoutTrailingNewline(text) else {
+            // 多行文字：iTerm2 的 Composer 这种原生多行编辑框，直接写进选区（不按键、不经过剪贴板，换行只是文字，按 Return 才发送）
+            if target.role == kAXTextAreaRole, target.bundleIdentifier == TerminalScript.iTerm2.bundleIdentifier {
+                switch writeSelectedText(text, to: target, terminalInputField: true) {
+                case .inserted, .uncertain:
+                    return .inserted
+                case .notApplicable:
+                    break
+                }
+            }
             return .unavailable(.multiLine)
         }
         guard !target.isSecureTextField, KeystrokeTyper.canType(line, maxUnitsPerCharacter: typingChunkLimit(pid: target.pid)) else {
@@ -2153,6 +2592,11 @@ private func typeIntoTerminal(_ text: String, target: FocusedTarget, keyTime: Da
             return .unavailable(.keystrokesWatched(watchers))
         }
         KeystrokeTyper.shared.type(line, into: target, keyTime: keyTime)
+        return .typing
+    }
+    // 前台是 Neovim：通过它自己的 RPC 接口粘贴，和真正的粘贴一样（见 NvimPaste）
+    if let candidates = NvimPaste.candidates(for: target) {
+        NvimPaste.pasteInBackground(text, candidates: candidates, target: target, keyTime: keyTime)
         return .typing
     }
     let pasted = TerminalScript.pasteIfPermitted(text, into: target, keyTime: keyTime) {
@@ -2170,14 +2614,28 @@ private let keystrokeBracketedPasteTerminalBundleIDs: Set<String> = [
     "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "net.kovidgoyal.kitty", "com.github.wez.wezterm", "org.alacritty",
 ]
 
-// 终端里模拟键入：只在 shell 提示符前键入。单行文字直接键入（去掉末尾的换行）；shell 可能开着 vi 键位时也包上 bracketed paste 的标记
+// 终端里模拟键入：只在 shell 提示符前键入。单行文字直接键入（去掉末尾的换行；终端按行收输入时要放得下，见 canonicalLineRefusal）；
+// shell 可能开着 vi 键位时也包上 bracketed paste 的标记
 // （命令模式里原样键入的字母是命令）。多行文字只在 shell 的行编辑器正在读、并且认得 bracketed paste 时，包成和真正粘贴一样的
 // ESC[200~ … ESC[201~ 键入——shell 收到后整段插入编辑缓冲区、不执行（单独键入换行等于按回车执行命令）
 private func typeIntoTerminalByKeys(_ text: String, target: FocusedTarget, keyTime: Date) -> ZeroExposurePasteResult {
+    // iTerm2 的 tmux 整合（tmux -CC）开着：整合开出来的标签页里，键入的按键由 iTerm2 变成 tmux 的命令送过去（tmux 把命令连同文字
+    // 记进消息记录），运行 tmux -CC 的标签页收到的文字本身就是 tmux 的命令。这里分不出焦点在哪个标签页（Copi 能用 iTerm2 的
+    // 脚本接口时由 TerminalScript 问 iTerm2），一律不键入
+    if target.bundleIdentifier == TerminalScript.iTerm2.bundleIdentifier, iTermTmuxIntegrationIsRunning(pid: target.pid) {
+        return .unavailable(.modalProgram("tmux"))
+    }
+    // WezTerm 的复制模式开着（读得到标题、以 "Copy mode: " 开头）：没在编辑搜索词时字母是命令（y 把选区复制到剪贴板并关掉它，
+    // 剩下的按键落进 shell）。标题看不出是不是在编辑搜索词：不键入，第二次按下经剪贴板时由 WezTerm 自己粘贴进它的搜索词
+    if target.focusedWindowTitle != nil, target.wezTermOverlayMayBeOpen {
+        return .unavailable(.modalProgram("copy mode"))
+    }
     let shells: [ForegroundProcess]
+    let ttys: [Int32]
     switch target.terminalForeground {
-    case .prompt(let found):
+    case .prompt(let found, let foundTTYs):
         shells = found
+        ttys = foundTTYs
     case .other(let program):
         // 前台是 tmux（终端里所有窗口合计只有这一个标签页、没有分屏时才认得出是它）：交给 tmux 粘贴进它当前的 pane（见 TmuxPaste）。
         // WezTerm 走到这里时是它自己的接口特意没接（复制模式、搜索框、启动器开着，粘贴应该落在那里），不能绕过去交给 tmux；
@@ -2186,26 +2644,47 @@ private func typeIntoTerminalByKeys(_ text: String, target: FocusedTarget, keyTi
         // 显示当前标签页的程序，要在标题里看到 tmux；别的终端要求只开着一个窗口
         if program == "tmux", ![TerminalScript.wezterm.bundleIdentifier, "org.alacritty"].contains(target.bundleIdentifier ?? ""),
            target.focusedSurfaceShowsTmux,
-           let client = TmuxPaste.soleClient(in: terminalForegroundGroups(of: target)) {
+           let groups = terminalForegroundGroups(of: target),
+           let client = TmuxPaste.soleClient(in: groups) ?? TmuxPaste.focusedClient(for: target, groups: groups) {
             TmuxPaste.pasteInBackground(text, client: client, target: target, keyTime: keyTime)
             return .typing
         }
-        return .unavailable(.modalProgram(program))
+        return typeIntoLineReader(text, program: program, target: target, keyTime: keyTime)
     }
     let limit = typingChunkLimit(pid: target.pid)
     let canBracket = { () -> Bool in
+        // WezTerm 的复制模式、搜索框可能开着（见 wezTermOverlayMayBeOpen）：bracketed paste 开头的 ESC 会关掉它，后面的按键落进
+        // shell，换行就是回车，一行行执行。不包：单行文字按普通按键键入（到达搜索框），多行文字不键入
+        if target.wezTermOverlayMayBeOpen {
+            return false
+        }
         guard let bundleID = target.bundleIdentifier, keystrokeBracketedPasteTerminalBundleIDs.contains(bundleID), !shells.isEmpty else {
             return false
         }
         return shells.allSatisfy { shellAcceptsBracketedPaste(pid: $0.pid, delivery: .keystrokes) && lineEditorIsReading(tty: $0.tty) }
     }
+    // 在等单个按键（zsh 的 read -q、bash 的 read -n 1）：键入的第一个字符就是回答。（有标签页停在 sudo 的密码提示时 shells 为空，
+    // 不看：设了 pwfeedback 的 sudo 读密码时也关掉 canonical 模式）
+    if shells.contains(where: { waitsForSingleKey($0) }) {
+        return .unavailable(.singleKeyPrompt)
+    }
     if let line = singleLineWithoutTrailingNewline(text) {
-        guard KeystrokeTyper.canType(line, maxUnitsPerCharacter: limit) else {
+        // shells 为空：有标签页停在 sudo 这类的密码提示
+        if let reason = canonicalLineRefusal(line, ttys: ttys, atPasswordPrompt: shells.isEmpty) {
+            return .unavailable(reason)
+        }
+        // 包不包 bracketed paste 只判断一次：包上时 Tab 按 ⇥ 键入，shell 原样插入；不包时 ⇥ 会触发补全，含 Tab 的文字照旧拒绝。
+        // 再判断一次可能得出不同的结果，Tab 就会在标记外面键入
+        let bracketed = canBracket()
+        guard KeystrokeTyper.canType(line, allowTabs: bracketed, maxUnitsPerCharacter: limit) else {
             return .unavailable(.noRoute)
         }
         let viMode = shells.contains { shellMayUseViMode(pid: $0.pid) }
-        if viMode, !canBracket() {
+        if viMode, !bracketed {
             return .unavailable(.viMode)
+        }
+        if !bracketed, shells.contains(where: { fishMayExpandAbbreviation(pid: $0.pid, line: line) }) {
+            return .unavailable(.shellAbbreviations)
         }
         guard InputSourceState.canTypeNow else {
             return .unavailable(.inputMethod)
@@ -2215,7 +2694,7 @@ private func typeIntoTerminalByKeys(_ text: String, target: FocusedTarget, keyTi
         }
         // 能包成 bracketed paste 就包上（和真正的粘贴一样）：键入的途中漏进来的回车（Secure Keyboard Entry 开着时 Copi 拦不到）
         // 只会变成一个换行，不会执行打了一半的命令
-        KeystrokeTyper.shared.type(line, into: target, keyTime: keyTime, bracketedPaste: viMode || canBracket())
+        KeystrokeTyper.shared.type(line, into: target, keyTime: keyTime, bracketedPaste: bracketed)
         return .typing
     }
     var body = KeystrokeTyper.normalizedNewlines(text)
@@ -2238,14 +2717,145 @@ private func typeIntoTerminalByKeys(_ text: String, target: FocusedTarget, keyTi
     return .typing
 }
 
+// 主线程：终端前台有没停在 shell 提示符前的程序（program；tmux 另外处理）。模拟键入时，以及终端自己的接口（见 TerminalScript）
+// 看到焦点所在的程序不在提示符前时，都由这里决定
+// 终端自己的接口说了焦点在哪个会话时（focusedGroup：iTerm2、读得到终端设备的 Ghostty、WezTerm），下面几条都只看那个会话：
+// 按键只会到达那里，别的标签页在等单个按键、开着全屏程序、用 vi 键位都不挡住往这里键入。否则看所有标签页（看不出焦点在哪个）
+//  - 有标签页的前台只有 shell、它在等单个按键（zsh 的 read -q、bash 的 read -n 1，停在提示符前的和运行脚本的都算）：看不出焦点
+//    在不在它那里，和都停在提示符前时一样拒绝。排在允许剪贴板回退的拒绝之前，第二次按下也不经过剪贴板（第一个字符就是回答）。
+//    不在提示符前的 shell 要读得到终端设置、确实在等才算：别的用户的 shell 读不到（`sudo -s` 打开的 root shell 在 sudo 新开的、
+//    属于 root 的伪终端上），没有证据说它在等，下面按行读的判断也不会往它那里键入，照 program 拒绝；
+//  - 前台程序在按行读（脚本里的 read、Python 的 input()、ssh、gpg 问密码……）：这一行由终端驱动编辑，键入的字母不会被当成命令，
+//    回车之前什么都不会发生，和用户自己打一样。要看的标签页都是这样或者停在 shell 提示符前；
+//  - 否则按 program 拒绝
+// 这一组前台进程只有 shell、它在等单个按键（提示符前的 zsh 的 read -q，脚本里的 read -n 1）
+func groupWaitsForSingleKey(_ group: [ForegroundProcess]) -> Bool {
+    guard !group.isEmpty, group.allSatisfy({ ["zsh", "bash", "sh"].contains($0.name) }) else {
+        return false
+    }
+    return group.allSatisfy(isAtPrompt) ? group.contains(where: waitsForSingleKey) : group.contains { readsSingleKey($0) == true }
+}
+
+func typeIntoLineReader(_ text: String, program: String?, target: FocusedTarget, keyTime: Date,
+                        focusedGroup: [ForegroundProcess]? = nil) -> ZeroExposurePasteResult {
+    let waitsForKey = groupWaitsForSingleKey
+    // 两项判断用同一份进程表
+    guard let groups = focusedGroup.map({ [$0] }) ?? terminalForegroundGroups(of: target) else {
+        return .unavailable(.modalProgram(program))
+    }
+    if groups.contains(where: waitsForKey) {
+        return .unavailable(.singleKeyPrompt)
+    }
+    if let line = singleLineWithoutTrailingNewline(text), let readers = lineReadersAndPromptShells(in: groups) {
+        return typeLineIntoLineReader(line, target: target, keyTime: keyTime, readers: readers)
+    }
+    return .unavailable(.modalProgram(program))
+}
+
+// groups 里的前台进程组都只是停在 shell 提示符前，或者前台程序在按行读（终端开着 canonical 模式）：按行读的那些终端设备，以及提示符前的 shell。
+// 有别的（全屏程序、关掉了 canonical 模式的程序）时为 nil
+private func lineReadersAndPromptShells(in groups: [[ForegroundProcess]]) -> (ttys: [Int32], shells: [ForegroundProcess])? {
+    var ttys: [Int32] = []
+    var shells: [ForegroundProcess] = []
+    for group in groups {
+        if group.allSatisfy(isAtPrompt) {
+            shells += group
+            continue
+        }
+        guard let tty = group.first?.tty, terminalReadsWholeLines(tty: tty) else {
+            return nil
+        }
+        // 终端开着 canonical 模式只说明它按行收输入，看不出前台程序是不是在读（macOS 看不到进程卡在哪个调用上）。运行脚本的 shell
+        // 在等它启动的程序（组里有它的子进程：bash install.sh 正在下载、安装），或者从管道、文件读脚本（curl … | bash、
+        // bash < install.sh：它的 read 读的不是终端）时，这一行多半留在终端里，等脚本之后读终端的地方读走（read -n 1 时第一个字符
+        // 就是回答）。shell 自己在读终端（脚本里的 read）时组里没有它的子进程。读不到父进程、标准输入时按是处理。
+        // 脚本启动的另一个脚本（install.sh 运行 ./configure.sh）exec 了自己的脚本，启动参数和启动它的 shell 不同：它不算"启动的程序"，
+        // 停在自己的 read 时和单层的脚本一样。脚本 fork 出来的子 shell（$(…)、( … )、管道里的函数，还没 exec 的）启动参数和父进程
+        // 一样，照旧算；读不到启动参数时也算。
+        // 终端关着回显、按行收输入（见 passwordIsBeingRead）时不看这两样：这是有程序正在读密码（脚本启动的 sudo、ssh），
+        // 它从终端读（curl … | bash 里的 sudo 也是），这一行就是给它的
+        let scriptShells = group.filter { terminalPromptPrograms.contains($0.name) && !terminalPasswordPrograms.contains($0.name) }
+        let scriptShellIDs = Set(scriptShells.map(\.pid))
+        let runsOwnScript = { (member: ForegroundProcess, parent: pid_t) -> Bool in
+            guard scriptShellIDs.contains(member.pid), let arguments = processArguments(pid: member.pid),
+                  let parentArguments = processArguments(pid: parent) else {
+                return false
+            }
+            return arguments != parentArguments
+        }
+        let waitsForLaunchedProgram = !scriptShellIDs.isEmpty && group.contains { member in
+            guard let parent = parentProcessID(of: member.pid) else {
+                return true
+            }
+            return scriptShellIDs.contains(parent) && !runsOwnScript(member, parent)
+        }
+        if scriptShells.contains(where: { !standardInputIsTerminal($0) }) || waitsForLaunchedProgram, !passwordIsBeingRead(tty: tty) {
+            return nil
+        }
+        ttys.append(tty)
+    }
+    return ttys.isEmpty ? nil : (ttys, shells)
+}
+
+// 往按行读的程序里键入一行：不加 bracketed paste 的标记（程序不认，标记会成为这一行的一部分）。看的标签页里有提示符前的 shell
+// 用 vi 键位时不键入（看不出焦点是不是在它那里，命令模式里字母是命令；只看焦点所在的会话时这里没有提示符前的 shell）；
+// 这一行要放得下（见 canonicalLineRefusal）
+private func typeLineIntoLineReader(_ line: String, target: FocusedTarget, keyTime: Date,
+                                    readers: (ttys: [Int32], shells: [ForegroundProcess])) -> ZeroExposurePasteResult {
+    if let reason = canonicalLineRefusal(line, ttys: readers.ttys, atPasswordPrompt: false) {
+        return .unavailable(reason)
+    }
+    guard !readers.shells.contains(where: { shellMayUseViMode(pid: $0.pid) }) else {
+        return .unavailable(.viMode)
+    }
+    if readers.shells.contains(where: { fishMayExpandAbbreviation(pid: $0.pid, line: line) }) {
+        return .unavailable(.shellAbbreviations)
+    }
+    guard KeystrokeTyper.canType(line, maxUnitsPerCharacter: typingChunkLimit(pid: target.pid)) else {
+        return .unavailable(.noRoute)
+    }
+    guard InputSourceState.canTypeNow else {
+        return .unavailable(.inputMethod)
+    }
+    if let watchers = keystrokeWatchersBlockingTyping(into: target.pid) {
+        return .unavailable(.keystrokesWatched(watchers))
+    }
+    KeystrokeTyper.shared.type(line, into: target, keyTime: keyTime)
+    return .typing
+}
+
 // JetBrains 的终端工具窗口：看不出焦点在哪个终端标签页，所以 IDE 里所有终端都停在 shell 提示符前时才键入，并且只键入单行文字
 // （多行文字要靠 bracketed paste，IDE 的终端怎么处理按出来的 ESC 没法确认）
 private func typeIntoIDETerminal(_ text: String, target: FocusedTarget, keyTime: Date) -> ZeroExposurePasteResult {
-    if case .other(let program) = target.terminalForeground {
+    let shells: [ForegroundProcess]
+    let ttys: [Int32]
+    switch target.terminalForeground {
+    case .prompt(let found, let foundTTYs):
+        shells = found
+        ttys = foundTTYs
+    case .other(let program):
+        // 看不出焦点在哪个终端：有终端里的脚本在等单个按键时，第二次按下也不经过剪贴板
+        if let groups = terminalForegroundGroups(of: target), groups.contains(where: groupWaitsForSingleKey) {
+            return .unavailable(.singleKeyPrompt)
+        }
         return .unavailable(.modalProgram(program))
+    }
+    // 有终端在等单个按键（zsh 的 read -q、bash 的 read -n 1）：键入的第一个字符就是回答
+    if shells.contains(where: { waitsForSingleKey($0) }) {
+        return .unavailable(.singleKeyPrompt)
     }
     guard let line = singleLineWithoutTrailingNewline(text) else {
         return .unavailable(.multiLine)
+    }
+    if let reason = canonicalLineRefusal(line, ttys: ttys, atPasswordPrompt: shells.isEmpty) {
+        return .unavailable(reason)
+    }
+    // vi 键位的命令模式里原样键入的字母是命令；IDE 的终端怎么处理按出来的 ESC 没法确认，不能像别的终端那样包上 bracketed paste
+    guard !shells.contains(where: { shellMayUseViMode(pid: $0.pid) }) else {
+        return .unavailable(.viMode)
+    }
+    if shells.contains(where: { fishMayExpandAbbreviation(pid: $0.pid, line: line) }) {
+        return .unavailable(.shellAbbreviations)
     }
     guard let role = target.role, axWritableRoles.contains(role),
           KeystrokeTyper.canType(line, maxUnitsPerCharacter: typingChunkLimit(pid: target.pid)) else {
@@ -2377,42 +2987,99 @@ private func axSubtreeHasText(_ element: AXUIElement, depth: Int, selectedOnly: 
     return axBudgetExhausted ? nil : false
 }
 
-// 键入进行中（event tap 线程读）：这时用户按下的回车先不给 App——聊天里会把打了一半的消息发出去，shell、虚拟机里会执行打了一半的
-// 命令。吞掉它，键入停下（见 GlobalMode.shouldSwallow、KeystrokeTyper.post）
+// 键入进行中（event tap 线程读）：这时用户按下的键都先不给 App，键入停下（见 GlobalMode 的 tap、KeystrokeTyper.post）。
+// 回车会把聊天里打了一半的消息发出去、让 shell 和虚拟机执行打了一半的命令；别的键会夹进打到一半的文字里；Esc 是用户要它停下。
+// ⌘X 之后只按一下退格删掉选中的文字：只扣下回车（会在删掉之前把消息发出去），别的键照常给 App（删除之前按下的，删除就不做了）。
+// 删除从排上队起（还在等 ⌘ 松开、等前一次键入打完）就扣下回车，见 holdReturnForCut
 enum TypingInterrupt {
     private static let lock = NSLock()
     private static var active = false
+    // 回车以外的键也扣下
+    private static var holdsAllKeys = true
     private static var returnPressed = false
-    // 吞掉的那个回车可能还按着：之后它的自动重复也吞掉，直到用户松开它、重新按下回车
-    private static var holdingReturn = false
-    // ⌘C/⌘V 拦截器没在跑时（手动模式、拦截器没起来）键入期间临时起的、只管回车的 tap
-    private static var returnTap: KeyTap?
+    private static var escapePressed = false
+    private static var otherKeyPressed = false
+    // 吞掉的那个键可能还按着：之后它的自动重复也吞掉，直到用户松开它
+    private static var heldKey: Int64?
+    // ⌘C/⌘V 拦截器没在跑时（手动模式、拦截器没起来）键入期间临时起的、只管按键的 tap
+    private static var keyTap: KeyTap?
     // 每次开始键入加一：之前安排的"过一会儿停掉临时 tap"据此知道 tap 又有人在用了
     private static var generation = 0
+    // 排上队、还没开始（begin）的 ⌘X 删除：编号 → 这期间扣下过回车没有
+    private static var pendingCuts: [Int: Bool] = [:]
+    private static var lastCut = 0
 
-    // 任意线程（键入队列）
-    static func begin() {
+    // 任意线程（键入队列）。holdsAllKeys 为 false 时只扣下回车（⌘X 的删除）。cut：这次删除排队时拿到的编号（见 holdReturnForCut），
+    // 从这里接着扣下回车，排队期间扣下过的回车算在这次里
+    static func begin(holdsAllKeys: Bool, cut: Int? = nil) {
         lock.lock()
         active = true
-        returnPressed = false
-        holdingReturn = false
+        self.holdsAllKeys = holdsAllKeys
+        returnPressed = cut.flatMap { pendingCuts.removeValue(forKey: $0) } ?? false
+        escapePressed = false
+        otherKeyPressed = false
+        heldKey = nil
         generation += 1
-        let existing = returnTap
-        let needsTap = !GlobalMode.shared.isInterceptingKeys && existing == nil
         lock.unlock()
-        // 沿用之前的临时 tap：它可能已经被系统作废了，start() 会重建
-        existing?.start()
-        if needsTap {
-            let tap = KeyTap(events: [.keyDown]) { event in
-                event.getIntegerValueField(.eventSourceUserData) != copiSyntheticEventMarker
-                    && [Int64(kVK_Return), Int64(kVK_ANSI_KeypadEnter)].contains(event.getIntegerValueField(.keyboardEventKeycode))
-                    && swallowReturn(isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0)
-            }
-            if tap.start() {
-                lock.lock()
-                returnTap = tap
-                lock.unlock()
-            }
+        startKeyTapIfNeeded()
+    }
+
+    // 主线程：⌘X 的删除排上队之前调用，返回它的编号。从这时起回车（带着修饰键的也算）先不给 App：删除排着队时（等 ⌘ 松开、
+    // 等前一次键入打完）按下的回车会在删掉之前把聊天里的消息连同要剪掉的文字发出去。回车照样记在硬件层的输入里，删除因此不做
+    // （见 KeystrokeTyper.run 里的 userActedSince）。删除开始时由 begin 接手，没开始就放弃时要调用 releaseCutHold
+    static func holdReturnForCut() -> Int {
+        lock.lock()
+        lastCut += 1
+        let cut = lastCut
+        pendingCuts[cut] = false
+        lock.unlock()
+        startKeyTapIfNeeded()
+        return cut
+    }
+
+    // 任意线程：编号为 cut 的删除没开始就结束了（调用几次都行，begin 接手之后什么都不做）。返回排队期间扣下过回车没有
+    @discardableResult
+    static func releaseCutHold(_ cut: Int) -> Bool {
+        lock.lock()
+        let returnHeld = pendingCuts.removeValue(forKey: cut) ?? false
+        let stopsTap = pendingCuts.isEmpty && !active && keyTap != nil
+        let scheduled = generation
+        lock.unlock()
+        if stopsTap {
+            stopTapLater(generation: scheduled, deadline: Date().addingTimeInterval(30))
+        }
+        return returnHeld
+    }
+
+    // 拦截器没在跑时起一个临时 tap；沿用之前的临时 tap：它可能已经被系统作废了，start() 会重建
+    private static func startKeyTapIfNeeded() {
+        let intercepting = GlobalMode.shared.isInterceptingKeys
+        lock.lock()
+        let existing = keyTap
+        lock.unlock()
+        if let existing {
+            existing.start()
+            return
+        }
+        guard !intercepting else {
+            return
+        }
+        let tap = KeyTap(events: [.keyDown]) { event in
+            event.getIntegerValueField(.eventSourceUserData) != copiSyntheticEventMarker
+                && swallowKey(event.getIntegerValueField(.keyboardEventKeycode), isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0)
+        }
+        guard tap.start() else {
+            return
+        }
+        // 主线程（holdReturnForCut）和键入队列（begin）可能同时起了一个：只留先记下的那个
+        lock.lock()
+        let duplicate = keyTap != nil
+        if !duplicate {
+            keyTap = tap
+        }
+        lock.unlock()
+        if duplicate {
+            tap.stop()
         }
     }
 
@@ -2420,9 +3087,9 @@ enum TypingInterrupt {
         lock.lock()
         active = false
         let scheduled = generation
-        let hasTap = returnTap != nil
+        let hasTap = keyTap != nil
         lock.unlock()
-        // 临时的 tap 再留一会儿：吞掉还按着的回车的自动重复，回车松开了再停
+        // 临时的 tap 再留一会儿：吞掉还按着的键的自动重复，松开了再停
         if hasTap {
             stopTapLater(generation: scheduled, deadline: Date().addingTimeInterval(30))
         }
@@ -2430,41 +3097,62 @@ enum TypingInterrupt {
 
     private static func stopTapLater(generation scheduled: Int, deadline: Date) {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
-            let returnHeld = CGEventSource.keyState(.hidSystemState, key: CGKeyCode(kVK_Return))
-                || CGEventSource.keyState(.hidSystemState, key: CGKeyCode(kVK_ANSI_KeypadEnter))
             lock.lock()
-            // 又开始键入了：tap 还要用
-            guard generation == scheduled, !active else {
+            let held = heldKey
+            lock.unlock()
+            let keyHeld = held.map { CGEventSource.keyState(.hidSystemState, key: CGKeyCode($0)) } ?? false
+            lock.lock()
+            // 又开始键入了、有删除排着队：tap 还要用（之后的 end、releaseCutHold 会再安排）
+            guard generation == scheduled, !active, pendingCuts.isEmpty else {
                 lock.unlock()
                 return
             }
-            if returnHeld, Date() < deadline {
+            if keyHeld, Date() < deadline {
                 lock.unlock()
                 stopTapLater(generation: scheduled, deadline: deadline)
                 return
             }
-            holdingReturn = false
-            let tap = returnTap
-            returnTap = nil
+            heldKey = nil
+            let tap = keyTap
+            keyTap = nil
             lock.unlock()
             tap?.stop()
         }
     }
 
-    // tap 线程：键入进行中时记下并返回 true（吞掉这个回车）；之后还按着的回车的自动重复也吞掉
-    static func swallowReturn(isRepeat: Bool) -> Bool {
+    // tap 线程：键入进行中时记下按了什么并返回 true（吞掉这个键），⌘X 的删除排着队时吞掉回车；之后还按着的这个键的自动重复也吞掉
+    static func swallowKey(_ keyCode: Int64, isRepeat: Bool) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        let isReturn = [Int64(kVK_Return), Int64(kVK_ANSI_KeypadEnter)].contains(keyCode)
+        // 有 ⌘X 的删除排着队（见 holdReturnForCut）：回车不管带不带修饰键都先不给 App，记在排着的每个删除上
+        let holdsForCut = isReturn && !pendingCuts.isEmpty
+        if holdsForCut {
+            pendingCuts = pendingCuts.mapValues { _ in true }
+        }
         if active {
-            returnPressed = true
-            holdingReturn = true
+            if !holdsAllKeys, !isReturn {
+                return false
+            }
+            if isReturn {
+                returnPressed = true
+            } else if keyCode == Int64(kVK_Escape) {
+                escapePressed = true
+            } else {
+                otherKeyPressed = true
+            }
+            heldKey = keyCode
             return true
         }
-        if holdingReturn {
-            if isRepeat {
+        if holdsForCut {
+            heldKey = keyCode
+            return true
+        }
+        if let held = heldKey {
+            if isRepeat, held == keyCode {
                 return true
             }
-            holdingReturn = false
+            heldKey = nil
         }
         return false
     }
@@ -2473,6 +3161,19 @@ enum TypingInterrupt {
         lock.lock()
         defer { lock.unlock() }
         return returnPressed
+    }
+
+    static var escapeWasPressed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return escapePressed
+    }
+
+    // 回车、Esc 以外的键
+    static var otherKeyWasPressed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return otherKeyPressed
     }
 }
 
@@ -2492,14 +3193,51 @@ func userActedSince(_ keyTime: Date) -> Bool {
     return sinceLastAction < keyAge - 0.03
 }
 
+// 硬件层在 time（按下按键、松开鼠标的时刻）之前不到 0.25 秒（或者之后）记下过一次 type 这种输入：多半是用户亲手按的，可以算作
+// "再按一次"的确认。只是推测：别的程序紧跟在用户自己的按键、点击之后发来的，以及经硬件层（HID）发来的点击、按键（键位重映射
+// 工具、宏工具、Copi 自己的自测程序都这样发），也会被当成亲手按的
+func hardwareInput(_ type: CGEventType, at time: Date) -> Bool {
+    CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: type) < Date().timeIntervalSince(time) + 0.25
+}
+
 // Safari / WKWebView：WebKit 的 AXTextOperation。同步执行，走真正的编辑命令（派发 beforeinput/input，能 ⌘Z 撤销），
 // 对 input、textarea、contenteditable 都有效；密码框的 text marker 被屏蔽，用不了。
 // 必须用 TextOperationReplacePreserveCase：旧的 TextOperationReplace 会改动大小写。Safari 18.2 以前不认识这个类型，
 // 会当成"选中"处理、原样返回选中的文字，据此判断不支持。
+// 选区起点所在的元素或它往上几层（到网页根节点为止）可编辑
+private func webSelectionIsEditable(_ markerRange: CFTypeRef, in element: AXUIElement) -> Bool {
+    guard let start = copyAXParameterizedAttribute(element, "AXStartTextMarkerForTextMarkerRange", markerRange),
+          let ownerRaw = copyAXParameterizedAttribute(element, "AXUIElementForTextMarker", start),
+          CFGetTypeID(ownerRaw) == AXUIElementGetTypeID() else {
+        return false
+    }
+    var node: AXUIElement? = (ownerRaw as! AXUIElement)
+    for _ in 0..<8 {
+        guard let current = node, !axBudgetExhausted else {
+            return false
+        }
+        var settable: DarwinBoolean = false
+        if AXUIElementIsAttributeSettable(current, kAXValueAttribute as CFString, &settable) == .success, settable.boolValue {
+            return true
+        }
+        if (copyAXAttribute(current, kAXRoleAttribute) as? String) == "AXWebArea" {
+            return false
+        }
+        node = asAXElement(copyAXAttribute(current, kAXParentAttribute))
+    }
+    return false
+}
+
 private func webKitTextOperation(_ text: String, into target: FocusedTarget) -> AXWriteResult {
     // WebKit 自己最多等 250ms：等不完它就不发，免得请求已经送达、Copi 却当作没写进去又补一次
     let timeout = min(0.4, axBudgetRemaining ?? 0.4)
     guard timeout >= 0.3, let markerRange = copyAXAttribute(target.element, "AXSelectedTextMarkerRange") else {
+        return .notApplicable
+    }
+    // 选区要在可编辑的地方：焦点在列表行、卡片这类不能编辑的元素上时，WebKit 照样回报"替换了"，其实什么都没插进去，
+    // Copi 却会说粘贴好了、吞掉 ⌘V。焦点控件可写就行；否则看选区起点所在的元素和它往上几层（焦点被工具栏按钮拿走、
+    // 光标还在编辑器里时照样能用）
+    guard target.isSettable(kAXValueAttribute) || webSelectionIsEditable(markerRange, in: target.element) else {
         return .notApplicable
     }
     let insert = target.role == kAXTextFieldRole ? normalizedForSingleLine(text) : text
@@ -2548,8 +3286,10 @@ private var pendingChromiumWrite = false
 private var unconfirmedChromiumWrite: (element: AXUIElement, oldValue: String, at: Date)?
 // 确认不接受 AX 写入的输入框（例如代码编辑器的代理输入框）：之后直接走别的方式
 private var chromiumWriteIgnored: (element: AXUIElement, at: Date)?
-// Chromium 通过无障碍接口给出的值最多 10000 字节，更长的值读到的是截断的，拼接写回会删掉后面的内容
-private let chromiumValueByteLimit = 9_000
+// Chromium 通过无障碍接口给出的字符串（包括值）最多 10000 字节（kMaxStringAttributeLength），更长的读到的是截断的，
+// 拼接写回会删掉后面的内容；复制也只会复制到前面一截。截断时退到 UTF-8 字符的边界上，最多再少 3 个字节（截在一个 4 字节的字符中间）：
+// 读到的值不到 9997 字节就一定是完整的，9997 字节及以上可能截断过，不可信
+private let chromiumValueByteLimit = 9_997
 
 // Firefox 的值没有长度上限（读到的不会被截断）
 private let geckoValueByteLimit = 4_000_000
@@ -2559,9 +3299,18 @@ private let geckoValueByteLimit = 4_000_000
 // 只能整值替换，所以先在选区处拼好新值，写完再把光标放回去。
 // 不能用于 contenteditable（会变成 setInnerText、或者丢掉富文本格式），也不能用于代码编辑器的代理输入框。
 // （Firefox 的 kAXSelectedText 写入有 bug：删除的范围不对，光标处插入会插到开头，所以不用它。）
-private func spliceValue(_ text: String, into target: FocusedTarget, byteLimit: Int = chromiumValueByteLimit) -> AXWriteResult {
+private func spliceValue(_ text: String, into target: FocusedTarget, keyTime: Date, byteLimit: Int = chromiumValueByteLimit) -> AXWriteResult {
     if let ignored = chromiumWriteIgnored, CFEqual(ignored.element, target.element), Date().timeIntervalSince(ignored.at) < 600 {
         return .notApplicable
+    }
+    // 刚打过字、点过：时间预算够的话等浏览器的无障碍树跟上（等的时候新按键排在 Copi 后面到不了页面；点击照样会到，等完再查一次）。
+    // 不等的话多行文字就只能第二次按下经过剪贴板
+    let settle = 0.3 - InputActivity.secondsSinceLastInput
+    if !pendingChromiumWrite, settle > 0, (axBudgetRemaining ?? 0) - settle >= 0.12 {
+        sleepAttentively(settle + 0.01)
+        if userActedSince(keyTime) {
+            return .notApplicable
+        }
     }
     // 浏览器的无障碍树要过一会儿才跟上页面：刚打过字、改过选区时读到的值和选区可能是旧的，拼出来会抹掉刚打的字
     guard !pendingChromiumWrite, InputActivity.secondsSinceLastInput >= 0.3,
@@ -2589,6 +3338,10 @@ private func spliceValue(_ text: String, into target: FocusedTarget, byteLimit: 
           selectionAgain.location == selection.location, selectionAgain.length == selection.length else {
         return .notApplicable
     }
+    // 已知限制：值里有落单的代理项（半个 emoji）时，Chromium 按严格 UTF-8 转换值失败，干脆不给值，AXValue 读出来是空的；
+    // AXStringForRange 也取自这个值，没有别的信号能和真正的空输入框区分开。字符数不是 0 时，上面字符数对不上的检查会拦下；
+    // 字符数也是 0、光标在开头、没有选中文字时，照样拼接会把整个输入框的内容换掉。不把读到的空值一律当作不可信：
+    // 那样所有空输入框都只能键入（按键看得见，太长的文字和多行文字还会被拒绝）
     let insert = role == kAXTextAreaRole
         ? text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
         : normalizedForSingleLine(text)
@@ -2719,8 +3472,8 @@ private func readWebSelection(_ target: FocusedTarget, engine: WebEngine) -> Str
     }
     // 原子输入框里的选区：直接读选中文字（contenteditable 有子节点，不走这里——Chromium 会把它的段落粘成一行）
     if let role = target.role, axWritableRoles.contains(role), target.childCount == 0 {
-        // Chromium 读出来的值最多 10000 字节，太长时不可信
-        if engine == .chromium, let value = target.value, value.utf8.count >= 9000 {
+        // Chromium 读出来的值最多 10000 字节，太长时不可信（见 chromiumValueByteLimit）
+        if engine == .chromium, let value = target.value, value.utf8.count >= chromiumValueByteLimit {
             return nil
         }
         return target.selectedText
@@ -2814,6 +3567,7 @@ private func markerIndex(_ element: AXUIElement, _ marker: AXTextMarker) -> Int?
 // 这里一段一段读出来再用换行拼起来。下一段从上一段的结尾直接开始读：之前从段落结尾往后再挪一个字符
 // （AXNextTextMarkerForTextMarker）当作跳过段落之间的换行，可整段文字里并没有换行，挪过去的是下一段的第一个字——每段丢一个字；
 // 选区末尾是图标、按钮这类嵌入对象时还会挪到一个无效的位置上，整次复制被拒绝。
+// 网页脚本设的选区起点落在元素边界上（例如紧挨表单控件、可编辑区）时，从起点找段落结尾原地不动：只在这时把起点换成紧跟着的第一个字的开头再走（见循环末尾）。
 // 逐段读出的文字连在一起必须正好等于整段读出的文字，对不上就不猜，返回 nil
 private func paragraphPreservingString(_ element: AXUIElement, markerRange rawRange: CFTypeRef) -> String? {
     guard CFGetTypeID(rawRange) == AXTextMarkerRangeGetTypeID() else {
@@ -2833,9 +3587,13 @@ private func paragraphPreservingString(_ element: AXUIElement, markerRange rawRa
         return nil
     }
     var paragraphs: [String] = []
+    // 每一段的结尾（落在这一段自己的文字里），用来认出它在表格的哪一格
+    var paragraphEnds: [AXTextMarker] = []
     var cursor = first
     var consumed = 0
     var reachedEnd = false
+    // 选区起点换过一次（见循环末尾）
+    var reanchored = false
     for _ in 0..<maxSelectionParagraphs {
         // 下一个段落结尾。确定没有了（已经是网页里最后一段）时，剩下的部分就是最后一段；出错、超时就不猜
         var paragraphEnd: AXTextMarker?
@@ -2867,6 +3625,10 @@ private func paragraphPreservingString(_ element: AXUIElement, markerRange rawRa
                 }
             }
         }
+        // 换了起点之后第一次找就说"后面没有段落结尾"：不信，否则整个选区会被当成一段，段落粘在一起
+        if reanchored, consumed == 0, paragraphLength == nil {
+            return nil
+        }
         reachedEnd = paragraphLength.map { consumed + $0 >= total } ?? true
         let stop = reachedEnd ? last : paragraphEnd!
         guard let paragraph = copyAXParameterizedAttribute(element, "AXStringForTextMarkerRange",
@@ -2874,12 +3636,24 @@ private func paragraphPreservingString(_ element: AXUIElement, markerRange rawRa
             return nil
         }
         paragraphs.append(paragraph)
+        paragraphEnds.append(stop)
         if reachedEnd {
             break
         }
-        // 没有往前走（不该发生）：不原地打转
-        guard let paragraphLength, paragraphLength > 0, let paragraphEnd else {
+        guard let paragraphLength, let paragraphEnd else {
             return nil
+        }
+        // 没有往前走：网页脚本设的选区起点落在元素边界上时会这样，Chromium 从这个起点找段落结尾原地不动。
+        // 只在选区起点、只换一次，而且这一段读出来确实是空的（不然拼的时候会在它后面多出一个换行）：换成紧跟着的第一个字的开头，
+        // 两处之间一个字都没有才换；换了还是不动就不猜，不原地打转。换了起点也不会多读、少读字：逐段读出的文字仍然必须正好等于从原来的起点整段读出的文字
+        if paragraphLength == 0 {
+            guard consumed == 0, !reanchored, paragraph.isEmpty,
+                  let start = nextCharacterStart(element, cursor) ?? childStart(element, cursor, last: last, total: total) else {
+                return nil
+            }
+            reanchored = true
+            cursor = start
+            continue
         }
         consumed += paragraphLength
         cursor = paragraphEnd
@@ -2891,15 +3665,104 @@ private func paragraphPreservingString(_ element: AXUIElement, markerRange rawRa
         return nil
     }
     // 段落末尾（或开头）已经是 <br> 带来的换行时不再补；空段落不留空行
-    let nonEmpty = paragraphs.filter { !$0.isEmpty }
+    let kept = zip(paragraphs, paragraphEnds).filter { !$0.0.isEmpty }
+    let nonEmpty = kept.map(\.0)
+    // 表格里同一行相邻的两格之间用 Tab（和浏览器自己复制的一样，粘贴进电子表格还是一行一行的）。要么每一段都认完，要么都不认
+    let cells = tableCells(element, kept.map(\.1))
     var result = ""
     for (index, paragraph) in nonEmpty.enumerated() {
         result += paragraph
         if index < nonEmpty.count - 1, !paragraph.hasSuffix("\n"), !nonEmpty[index + 1].hasPrefix("\n") {
-            result += "\n"
+            if let cells, let this = cells[index], let next = cells[index + 1], !CFEqual(this.cell, next.cell), CFEqual(this.row, next.row) {
+                result += "\t"
+            } else {
+                result += "\n"
+            }
         }
     }
     return result
+}
+
+// 每个位置所在的表格单元格和它所在的行（不在表格里为 nil）。Accessibility 的时间预算快用完、读不出来时整个返回 nil
+private func tableCells(_ element: AXUIElement, _ markers: [AXTextMarker]) -> [(cell: AXUIElement, row: AXUIElement)?]? {
+    // 很长的选区（整页全选）不认：每段要多问好几次，复制会变慢
+    guard markers.count <= 300 else {
+        return nil
+    }
+    var cells: [(cell: AXUIElement, row: AXUIElement)?] = []
+    for marker in markers {
+        guard (axBudgetRemaining ?? 1) > 0.15,
+              let ownerRaw = copyAXParameterizedAttribute(element, "AXUIElementForTextMarker", marker),
+              CFGetTypeID(ownerRaw) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        var node: AXUIElement? = (ownerRaw as! AXUIElement)
+        var found: (cell: AXUIElement, row: AXUIElement)?
+        for _ in 0..<4 {
+            guard let current = node else {
+                break
+            }
+            let role = copyAXAttribute(current, kAXRoleAttribute) as? String
+            if role == kAXCellRole {
+                if let row = asAXElement(copyAXAttribute(current, kAXParentAttribute)) {
+                    found = (current, row)
+                }
+                break
+            }
+            if role == kAXRowRole || role == kAXTableRole || role == "AXWebArea" {
+                break
+            }
+            node = asAXElement(copyAXAttribute(current, kAXParentAttribute))
+        }
+        cells.append(found)
+    }
+    return cells
+}
+
+// marker 后面紧跟着的第一个字的开头：往后挪一个字，再往前挪一个字。marker 和它之间一个字都没有时才返回，否则不猜
+private func nextCharacterStart(_ element: AXUIElement, _ marker: AXTextMarker) -> AXTextMarker? {
+    guard let nextRaw = copyAXParameterizedAttribute(element, "AXNextTextMarkerForTextMarker", marker),
+          CFGetTypeID(nextRaw) == AXTextMarkerGetTypeID(),
+          let startRaw = copyAXParameterizedAttribute(element, "AXPreviousTextMarkerForTextMarker", nextRaw),
+          CFGetTypeID(startRaw) == AXTextMarkerGetTypeID() else {
+        return nil
+    }
+    let start = startRaw as! AXTextMarker
+    guard textLength(element, AXTextMarkerRangeCreate(kCFAllocatorDefault, marker, start)) == 0 else {
+        return nil
+    }
+    return start
+}
+
+// 选区起点是"某个元素的第几个子元素之前"（网页脚本用 selectNodeContents、setBaseAndExtent(元素, 0, …) 设的选区）时，Chromium 从它
+// 往后挪一个字原地不动，再往前挪却跑到网页开头（nextCharacterStart 因此不换）。改用起点所在元素的子元素：从子元素的开头到选区
+// 末尾的文字，子元素越靠后越少，第一个正好等于整个选区的那个，它的开头就是选区里第一个字的位置（前面的子元素没有字也一样）。
+// 对不上就不猜；换了起点之后逐段读出的文字仍然必须正好等于从原来的起点整段读出的文字（见 paragraphPreservingString）
+private func childStart(_ element: AXUIElement, _ marker: AXTextMarker, last: AXTextMarker, total: Int) -> AXTextMarker? {
+    guard let ownerRaw = copyAXParameterizedAttribute(element, "AXUIElementForTextMarker", marker),
+          CFGetTypeID(ownerRaw) == AXUIElementGetTypeID(),
+          let children = copyAXAttribute(ownerRaw as! AXUIElement, kAXChildrenAttribute) as? [AnyObject] else {
+        return nil
+    }
+    // 起点在很靠后的子元素前面时要一个个量过去：最多看 64 个
+    for child in children.prefix(64) {
+        guard CFGetTypeID(child) == AXUIElementGetTypeID(),
+              let rangeRaw = copyAXParameterizedAttribute(element, "AXTextMarkerRangeForUIElement", child),
+              CFGetTypeID(rangeRaw) == AXTextMarkerRangeGetTypeID() else {
+            return nil
+        }
+        let start = AXTextMarkerRangeCopyStartMarker(rangeRaw as! AXTextMarkerRange)
+        guard let remaining = textLength(element, AXTextMarkerRangeCreate(kCFAllocatorDefault, start, last)) else {
+            return nil
+        }
+        if remaining == total {
+            return start
+        }
+        if remaining < total {
+            return nil
+        }
+    }
+    return nil
 }
 
 private func textLength(_ element: AXUIElement, _ range: AXTextMarkerRange) -> Int? {
@@ -2946,8 +3809,6 @@ enum InputActivity {
 final class KeystrokeTyper {
     static let shared = KeystrokeTyper()
 
-    // 太长的文字打起来又慢又容易出错（也容易和用户自己的按键交错）
-    static let maxLength = 4000
     // 每个事件最多带 20 个 UTF-16 单元，多了会被系统悄悄截掉
     static let chunkLimit = 20
 
@@ -2979,6 +3840,10 @@ final class KeystrokeTyper {
         let perCharacter: Bool
         // 每个按键事件最多带几个 UTF-16 单元（见 typingChunkLimit）
         let maxUnitsPerEvent: Int
+        // ⌘X 的删除：排队时扣下回车拿到的编号（见 TypingInterrupt.holdReturnForCut）
+        var cutHold: Int? = nil
+        // ⌘X 的删除（Chromium、Electron）：复制时选区的样子（见 selectionFingerprint）。删除前选区变了就不删
+        var cutSelection: String? = nil
 
         var isCut: Bool {
             if case .deleteSelection = action {
@@ -3012,6 +3877,25 @@ final class KeystrokeTyper {
         }
     }
 
+    // 一次键入打在哪里
+    private struct TypingSpot {
+        let pid: pid_t
+        let element: AXUIElement
+        // 分格验证码：焦点会自己跳到同一进程里的下一格，只看进程
+        let anyFieldInApp: Bool
+
+        // element 为 nil（读不到焦点控件）时只看进程
+        func covers(pid: pid_t, element: AXUIElement?) -> Bool {
+            guard self.pid == pid else {
+                return false
+            }
+            guard let element, !anyFieldInApp else {
+                return true
+            }
+            return CFEqual(self.element, element)
+        }
+    }
+
     private let queue = DispatchQueue(label: "Copi.KeystrokeTyper", qos: .userInteractive)
     // 只在 queue 上用：这次键入因为途中有程序开始看按键而停下时，那些程序的名字
     private var watchersStoppedTyping: [String]?
@@ -3019,6 +3903,10 @@ final class KeystrokeTyper {
     private var typingStartedAt = Date.distantPast
     private var pending: [Job] = []
     private var isTyping = false
+    // 只在主线程用：正在往哪里发按键（开始发之前设上，发完或停下时清掉；⌘X 的删除不算）
+    private var typingSpot: TypingSpot?
+    // 只在主线程用：最近一次打到一半就停下的粘贴打在哪里、什么时候停的
+    private var stoppedPartway: (spot: TypingSpot, at: Date)?
 
     // 统一换行：\r\n、\r 都当作一个换行
     static func normalizedNewlines(_ text: String) -> String {
@@ -3026,9 +3914,10 @@ final class KeystrokeTyper {
     }
 
     // 能用键入完成的文字：不含制表符等控制字符（Tab 会切换焦点），换行只在 allowNewlines 时可以有；
-    // 也不含单个字符就超过一个按键事件能带的 UTF-16 单元数的组合（会被截断，见 typingChunkLimit）
+    // 也不含单个字符就超过一个按键事件能带的 UTF-16 单元数的组合（会被截断，见 typingChunkLimit）。不限长度：
+    // 长的打得久一些，键入时屏幕上显示进度（见 CopiHUD），按 Esc 停下
     static func canType(_ text: String, allowNewlines: Bool = false, allowTabs: Bool = false, maxUnitsPerCharacter: Int = chunkLimit) -> Bool {
-        guard !text.isEmpty, text.utf16.count <= maxLength else {
+        guard !text.isEmpty else {
             return false
         }
         if text.unicodeScalars.contains(where: {
@@ -3051,9 +3940,40 @@ final class KeystrokeTyper {
         enqueue(Job(action: .pressKeys(strokes), target: target, keyTime: keyTime, perCharacter: false, maxUnitsPerEvent: Self.chunkLimit))
     }
 
-    // 主线程调用：删除焦点控件里选中的内容（⌘X）
+    // 主线程调用：删除焦点控件里选中的内容（⌘X）。从排上队起就扣下回车（见 TypingInterrupt.holdReturnForCut）：这时 ⌘X 还在
+    // event tap 那里等着处理完，排在它后面的回车也拦得到
     func deleteSelection(in target: FocusedTarget, keyTime: Date) {
-        enqueue(Job(action: .deleteSelection, target: target, keyTime: keyTime, perCharacter: false, maxUnitsPerEvent: Self.chunkLimit))
+        enqueue(Job(action: .deleteSelection, target: target, keyTime: keyTime, perCharacter: false, maxUnitsPerEvent: Self.chunkLimit,
+                    cutHold: TypingInterrupt.holdReturnForCut(),
+                    cutSelection: isChromiumApp(pid: target.pid) ? Self.selectionFingerprint(target) : nil))
+    }
+
+    // 主线程：选区的样子（输入框里是起点和长度，可编辑区里是选中的字数）。Chromium 的无障碍树是异步更新的：⌘X 时读出、存进 Copi 的
+    // 可能是还没跟上的旧选区，按出的退格删的却是真正的选区，多出来的那部分就丢了。删除前再读一次，不一样就不删
+    static func selectionFingerprint(_ target: FocusedTarget) -> String? {
+        if target.childCount == 0, let range = target.selectedRange {
+            return "\(range.location):\(range.length)"
+        }
+        guard let markerRange = copyAXAttribute(target.element, "AXSelectedTextMarkerRange"),
+              let length = copyAXParameterizedAttribute(target.element, "AXLengthForTextMarkerRange", markerRange) as? NSNumber else {
+            return nil
+        }
+        return "m:\(length.intValue)"
+    }
+
+    // 主线程：要粘贴进 pid 的 element（nil：读不到焦点控件，只看 App）时，Copi 是不是还在往那里键入上一次粘贴，或者上一次粘贴
+    // 刚刚（keyTime 之前 2 秒内）在那里打到一半停下了。键入途中再按 ⌘V：⌘ 一按下键入就停了（和按别的键一样，见 post），
+    // 这时再粘贴一遍，那里就成了半段加一整段。还在等修饰键松开、还没开始发按键的不算：新的这次按键会让它自己放弃（见 run），
+    // 这次照常粘贴
+    func isTypingOrJustStopped(into pid: pid_t, element: AXUIElement?, keyTime: Date) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let spot = typingSpot, spot.covers(pid: pid, element: element) {
+            return true
+        }
+        if let stopped = stoppedPartway, keyTime.timeIntervalSince(stopped.at) < 2, stopped.spot.covers(pid: pid, element: element) {
+            return true
+        }
+        return false
     }
 
     private func enqueue(_ job: Job) {
@@ -3074,10 +3994,13 @@ final class KeystrokeTyper {
         waitForModifiersReleased(deadline: Date().addingTimeInterval(0.8)) { [self] released in
             guard released else {
                 let appName = job.target.applicationName
+                // ⌘X 的删除排着队时扣下过回车：那个回车也没给 App
+                let returnHeld = job.cutHold.map(TypingInterrupt.releaseCutHold) ?? false
                 notifyCopiNotice(job.isCut
-                    ? "Copi copied the text but didn't delete it from \(appName) because keys were still held down."
+                    ? "Copi copied the text but didn't delete it from \(appName) because keys were still held down"
+                        + (returnHeld ? ", and didn't send the Return you pressed. Check the field before sending." : ".")
                     : "Copi didn't type the paste into \(appName) because keys were still held down. Press ⌘V again.")
-                finishJob()
+                finishJob(job)
                 return
             }
             // 稍等一下再检查：⌘Tab 这类操作在松开 ⌘ 的那一刻才生效。输入源刚切换过（包括焦点进入密码框时系统强制切到英文）
@@ -3090,7 +4013,7 @@ final class KeystrokeTyper {
                    !InputSourceState.isASCIIKeyboardLayoutActive, InputSourceSwitcher.shared.isEnabled {
                     if job.target.hasMarkedText {
                         notifyCopiNotice("Finish or cancel what you're typing with the input method in \(job.target.applicationName), then press ⌘V again.")
-                        finishJob()
+                        finishJob(job)
                         return
                     }
                     InputSourceSwitcher.shared.switchToASCII { [self] switched in
@@ -3116,7 +4039,7 @@ final class KeystrokeTyper {
         let lengthBefore = switched == nil ? nil : job.target.numberOfCharacters
         let finish = { [self] (typedChunks: Int) in
             guard let switched else {
-                finishJob()
+                finishJob(job)
                 return
             }
             // 等目标 App 处理完排队的按键再切回去，否则最后几个字会被输入法拿去组字。虚拟机、远程桌面直接选回去：它们捕获键盘时
@@ -3130,7 +4053,7 @@ final class KeystrokeTyper {
             InputSourceSwitcher.shared.restore(switched, directly: pressesKeys, consumed: { done in
                 Self.waitUntilConsumed(job.target, lengthBefore: lengthBefore, typedChunks: typedChunks, then: done)
             }) { [self] in
-                finishJob()
+                finishJob(job)
             }
         }
         guard inputSourceReady else {
@@ -3138,10 +4061,16 @@ final class KeystrokeTyper {
             finish(0)
             return
         }
-        guard !userActedSince(job.keyTime), Self.focusMatches(job) else {
-            notifyCopiNotice(job.isCut
-                ? "Copi copied the text but didn't delete it from \(appName) because the focus or your input changed."
-                : "Copi didn't type the paste into \(appName) because the focus or your input changed. Press ⌘V again.")
+        let selectionChanged = job.cutSelection.map { $0 != Self.selectionFingerprint(job.target) } ?? false
+        guard !userActedSince(job.keyTime), !selectionChanged, Self.focusMatches(job) else {
+            if !job.isCut {
+                notifyCopiNotice("Copi didn't type the paste into \(appName) because the focus or your input changed. Press ⌘V again.")
+            } else if job.cutHold.map(TypingInterrupt.releaseCutHold) == true {
+                // 删除排着队时扣下过回车：那个回车也没给 App
+                notifyCopiNotice("Copi copied the text but didn't delete it from \(appName) because you pressed Return before it could, and didn't send that Return. Check the field before sending.")
+            } else {
+                notifyCopiNotice("Copi copied the text but didn't delete it from \(appName) because the focus or your input changed.")
+            }
             finish(0)
             return
         }
@@ -3168,40 +4097,89 @@ final class KeystrokeTyper {
             return
         }
         let inputSourceGeneration = InputSourceState.changeGeneration
+        // 记下正在往哪里键入：打完之前又要粘贴进这里的，不粘贴（见 isTypingOrJustStopped）
+        let spot = TypingSpot(pid: job.target.pid, element: job.target.element, anyFieldInApp: job.perCharacter)
+        if !job.isCut {
+            typingSpot = spot
+        }
+        // 要打一阵子的：屏幕上显示进度和"按 Esc 停下"
+        let progressGeneration = !job.isCut && Self.expectedDuration(of: job, chunks: chunks.count) > 1.5
+            ? CopiHUD.shared.showProgress(appName: appName, total: chunks.count) : nil
+        let progress: ((Int) -> Void)? = progressGeneration.map { generation in
+            { done in
+                DispatchQueue.main.async {
+                    CopiHUD.shared.update(done, generation: generation)
+                }
+            }
+        }
+        // ⌘X 的删除前的字符数（原生控件）：Backspace 按出去不等于删掉了（Xcode 的 Vim 模式里它只是左移光标），删完确认字数少了
+        // 才说剪切好了。网页（Chromium、Electron）的字符数更新得晚、有上限，不确认
+        let cutLengthBefore = job.isCut && !job.target.isWebContent ? job.target.numberOfCharacters : nil
         queue.async { [self] in
             var unclosedBracket = false
+            var openBracketLeft = false
             let completed: Int
-            TypingInterrupt.begin()
+            // ⌘X 的删除：由这里接着扣下排队时就扣下的回车
+            TypingInterrupt.begin(holdsAllKeys: !job.isCut, cut: job.cutHold)
             defer { TypingInterrupt.end() }
             typingStartedAt = Date()
             if case .pressKeys(let strokes) = job.action {
-                completed = pressKeys(strokes, for: job)
+                completed = pressKeys(strokes, for: job, progress: progress)
             } else if case .typeBracketedPaste = job.action {
                 completed = post(chunks, for: job, inputSourceGeneration: inputSourceGeneration,
-                                 closing: Self.bracketedPasteEnd(limit: job.maxUnitsPerEvent).count, unclosed: &unclosedBracket)
+                                 closing: Self.bracketedPasteEnd(limit: job.maxUnitsPerEvent).count, unclosed: &unclosedBracket,
+                                 leftOpen: &openBracketLeft, progress: progress)
             } else {
-                completed = post(chunks, for: job, inputSourceGeneration: inputSourceGeneration)
+                completed = post(chunks, for: job, inputSourceGeneration: inputSourceGeneration, progress: progress)
             }
             let needsClosing = unclosedBracket
-            // 没打完：是不是因为途中有程序开始看按键（见 post）、用户按了回车
+            // 停在 bracketed paste 中间、焦点已经离开，没能补发结束标记（见 post）：shell 会一直把之后的按键当成粘贴的内容
+            let stuck = openBracketLeft ? " If the shell in \(appName) stops responding, press Control-C." : ""
+            // 没打完：是不是因为途中有程序开始看按键（见 post）、用户按了回车、Esc 或者别的键
             let watchers = completed < chunks.count ? watchersStoppedTyping : nil
             watchersStoppedTyping = nil
             let returnPressed = TypingInterrupt.returnWasPressed
+            let escapePressed = TypingInterrupt.escapeWasPressed
+            let otherKeyPressed = TypingInterrupt.otherKeyWasPressed
             DispatchQueue.main.async {
-                if returnPressed, completed < chunks.count {
-                    notifyCopiNotice("Copi stopped typing into \(appName) because you pressed Return before it finished, and didn't send that Return. Check the field before sending.")
+                if let progressGeneration {
+                    CopiHUD.shared.hide(generation: progressGeneration)
+                }
+                if !job.isCut {
+                    self.typingSpot = nil
+                    // 打到一半停下了：紧接着又要粘贴进这里的也不粘贴，免得接在打出来的半段后面
+                    if completed > 0, completed < chunks.count {
+                        self.stoppedPartway = (spot, Date())
+                    }
+                }
+                if returnPressed, completed < chunks.count, job.isCut {
+                    notifyCopiNotice("Copi copied the text but didn't delete it from \(appName) because you pressed Return before it could, and didn't send that Return. Check the field before sending.")
+                } else if returnPressed, completed < chunks.count {
+                    notifyCopiNotice("Copi stopped typing into \(appName) because you pressed Return before it finished, and didn't send that Return. Check the field before sending." + stuck)
                 } else if returnPressed, !job.isCut {
                     notifyCopiNotice("Copi held back a Return you pressed while it was finishing typing into \(appName). Press Return again if you meant to send it.")
+                } else if escapePressed, completed < chunks.count {
+                    notifyCopiNotice((completed == 0
+                        ? "You stopped Copi with Esc before it typed anything into \(appName)."
+                        : "You stopped Copi with Esc, so it typed only part of the paste into \(appName). Check the field before pasting again.") + stuck)
+                } else if otherKeyPressed, completed < chunks.count {
+                    notifyCopiNotice((completed == 0
+                        ? "Copi didn't type the paste into \(appName) because you pressed a key, and kept that key from reaching \(appName). Press ⌘V again."
+                        : "Copi stopped typing into \(appName) because you pressed a key, and kept that key from reaching \(appName) so it didn't land in the middle of the paste. Check the field before pasting again.") + stuck)
+                } else if (escapePressed || otherKeyPressed), !job.isCut {
+                    notifyCopiNotice("Copi held back a key you pressed while it was finishing typing into \(appName), so it didn't land in the paste. Press it again if you need it.")
                 } else if let watchers {
                     let names = ListFormatter.localizedString(byJoining: Array(watchers.prefix(3)))
-                    notifyCopiNotice(completed == 0
+                    notifyCopiNotice((completed == 0
                         ? "Copi didn't type the paste into \(appName) because \(names) can now see keystrokes."
-                        : "Copi stopped typing the paste into \(appName) because \(names) started watching keystrokes. Check the field before pasting again.")
+                        : "Copi stopped typing the paste into \(appName) because \(names) started watching keystrokes. Check the field before pasting again.") + stuck)
                 } else if job.isCut {
-                    if completed == chunks.count {
+                    if completed == chunks.count, let cutLengthBefore {
+                        Self.confirmCut(job.target, lengthBefore: cutLengthBefore, deletedAt: Date())
+                    } else if completed == chunks.count {
                         notifyProtected("Cut safely")
                     } else {
-                        notifyCopiNotice("Copi copied the text but didn't delete it from \(appName) because the focus moved.")
+                        notifyCopiNotice("Copi copied the text but didn't delete it from \(appName) because the focus or your input changed.")
                     }
                 } else if completed == chunks.count {
                     notifyProtected("Pasted safely")
@@ -3209,7 +4187,7 @@ final class KeystrokeTyper {
                     notifyCopiNotice("Copi didn't type the paste into \(appName) because the focus moved or you kept typing. Press ⌘V again.")
                 } else {
                     // 不说打了几个字：通知会留在通知中心里，密码的长度也不该透露
-                    notifyCopiNotice("Copi typed only part of the paste into \(appName) before the focus or input method changed. Check the field before pasting again.")
+                    notifyCopiNotice("Copi typed only part of the paste into \(appName) before the focus or input method changed. Check the field before pasting again." + stuck)
                 }
                 if needsClosing {
                     self.closeBracketedPaste(job) {
@@ -3239,7 +4217,8 @@ final class KeystrokeTyper {
                 return
             }
             queue.async { [self] in
-                if Self.focusMatches(job) {
+                let focused = Self.focusMatches(job)
+                if focused {
                     let source = CGEventSource(stateID: .privateState)
                     for chunk in Self.bracketedPasteEnd(limit: job.maxUnitsPerEvent) {
                         emit(chunk, source: source, to: job.target.pid)
@@ -3247,6 +4226,10 @@ final class KeystrokeTyper {
                     }
                 }
                 DispatchQueue.main.async {
+                    // 焦点已经离开终端：没能补发
+                    if !focused {
+                        notifyCopiNotice("The input method changed while Copi was typing into \(appName). If the shell stops responding, press Control-C.")
+                    }
                     InputSourceSwitcher.shared.restore(switched, consumed: { finished in
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                             finished(())
@@ -3259,7 +4242,8 @@ final class KeystrokeTyper {
 
     // 主线程：等目标 App 处理完打进去的字——字符数变了并且稳定 50 毫秒；读不到字符数（终端、密码框）时按发出的按键数估一个时间
     private static func waitUntilConsumed(_ target: FocusedTarget, lengthBefore: Int?, typedChunks: Int, then done: @escaping (()) -> Void) {
-        let fallback = typedChunks == 0 ? 0 : min(1.0, max(0.3, 0.15 + Double(typedChunks) * 0.004))
+        // 打得多的，目标 App 要处理一阵子：最多等 10 秒
+        let fallback = typedChunks == 0 ? 0 : min(10, max(0.3, 0.15 + Double(typedChunks) * 0.004))
         guard typedChunks > 0, let lengthBefore else {
             DispatchQueue.main.asyncAfter(deadline: .now() + fallback) {
                 done(())
@@ -3299,7 +4283,11 @@ final class KeystrokeTyper {
         }
     }
 
-    private func finishJob() {
+    // job 做完或放弃了。⌘X 的删除没开始就放弃时，放开排队时扣下的回车（开始过的已经由 begin 接手，这里什么都不做）
+    private func finishJob(_ job: Job) {
+        if let cut = job.cutHold {
+            TypingInterrupt.releaseCutHold(cut)
+        }
         isTyping = false
         startNextIfIdle()
     }
@@ -3318,6 +4306,14 @@ final class KeystrokeTyper {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [self] in
             waitForModifiersReleased(deadline: deadline, then: action)
         }
+    }
+
+    // 大概要打多久（秒）：一般每块两三毫秒加上焦点检查，逐字符的每个 20 毫秒，虚拟机里的真实按键每个几十毫秒
+    private static func expectedDuration(of job: Job, chunks: Int) -> TimeInterval {
+        if case .pressKeys = job.action {
+            return Double(chunks) * 0.045
+        }
+        return Double(chunks) * (job.perCharacter ? 0.022 : 0.004)
     }
 
     // bracketed paste 的结束标记：ESC 用真正的 esc 键（文字事件里的 ESC 会被有的终端改写或丢掉）
@@ -3372,16 +4368,36 @@ final class KeystrokeTyper {
     // 每块之前都确认焦点还在目标上、用户没有接着操作；返回实际发出去的块数。
     // closing：结尾的这几块（bracketed paste 的 ESC[201~）。中途放弃时如果焦点还在终端上，照样补发它们结束粘贴——
     // 否则 shell 会一直把之后的按键当成粘贴的内容。输入源已经不是英文时不能直接补发（文字会进输入法），
-    // 把 unclosed 设为 true，由调用方先切到英文再补发
-    private func post(_ chunks: [Chunk], for job: Job, inputSourceGeneration: Int, closing: Int = 0) -> Int {
+    // 把 unclosed 设为 true，由调用方先切到英文再补发。焦点已经不在终端上时补发的按键会到达别处，不补发，
+    // 把 leftOpen 设为 true，由调用方告诉用户
+    // progress：每发出一些块报一次已经发出的块数（显示进度用）
+    private func post(_ chunks: [Chunk], for job: Job, inputSourceGeneration: Int, closing: Int = 0, progress: ((Int) -> Void)? = nil) -> Int {
         var unclosed = false
-        return post(chunks, for: job, inputSourceGeneration: inputSourceGeneration, closing: closing, unclosed: &unclosed)
+        var leftOpen = false
+        return post(chunks, for: job, inputSourceGeneration: inputSourceGeneration, closing: closing, unclosed: &unclosed, leftOpen: &leftOpen,
+                    progress: progress)
     }
 
-    private func post(_ chunks: [Chunk], for job: Job, inputSourceGeneration: Int, closing: Int, unclosed: inout Bool) -> Int {
+    private func post(_ chunks: [Chunk], for job: Job, inputSourceGeneration: Int, closing: Int, unclosed: inout Bool, leftOpen: inout Bool,
+                      progress: ((Int) -> Void)? = nil) -> Int {
         let source = CGEventSource(stateID: .privateState)
         var completed = 0
+        var reportedAt = Date()
+        // 上一块是 ESC：bracketed paste 的标记（ESC[200~、ESC[201~）要紧接着发完，中间不做检查也不停顿——隔得久了，shell、vim 会把
+        // ESC 当成单独按了一下 Esc（zsh 的 KEYTIMEOUT、vim 的 ttimeoutlen 可能只有几十毫秒）
+        var followsEscape = false
         for (index, chunk) in chunks.enumerated() {
+            if followsEscape {
+                followsEscape = false
+                emit(chunk, source: source, to: job.target.pid)
+                completed += 1
+                usleep(2_000)
+                continue
+            }
+            if let progress, Date().timeIntervalSince(reportedAt) >= 0.1 {
+                progress(completed)
+                reportedAt = Date()
+            }
             // 中途切换了输入法（快捷键、工具切换、焦点进出密码框）：接下来的字符可能被输入法拿去。
             // 打开了 "Don't Type When Keystrokes Are Watched"、途中有程序装上了能看到按键的 tap：停下（tap 清单缓存 1 秒）
             let watchers = job.isCut ? nil : keystrokeWatchersBlockingTyping(into: job.target.pid, fresh: true)
@@ -3393,16 +4409,20 @@ final class KeystrokeTyper {
             let interrupted = { userActedSince(job.keyTime) || modifierPressedSince(self.typingStartedAt) || TypingInterrupt.returnWasPressed }
             if interrupted() || !Self.focusMatches(job) || InputSourceState.changeGeneration != inputSourceGeneration
                 || watchers != nil || sessionIsLockedNow() || interrupted() {
-                if closing > 0, index > 0, index < chunks.count, Self.focusMatches(job) {
-                    let ascii = InputSourceState.changeGeneration == inputSourceGeneration
-                        || DispatchQueue.main.sync { InputSourceState.isASCIIKeyboardLayoutActive }
-                    if ascii {
-                        for tail in chunks[max(index, chunks.count - closing)...] {
-                            emit(tail, source: source, to: job.target.pid)
-                            usleep(2_000)
+                if closing > 0, index > 0, index < chunks.count {
+                    if Self.focusMatches(job) {
+                        let ascii = InputSourceState.changeGeneration == inputSourceGeneration
+                            || DispatchQueue.main.sync { InputSourceState.isASCIIKeyboardLayoutActive }
+                        if ascii {
+                            for tail in chunks[max(index, chunks.count - closing)...] {
+                                emit(tail, source: source, to: job.target.pid)
+                                usleep(2_000)
+                            }
+                        } else {
+                            unclosed = true
                         }
                     } else {
-                        unclosed = true
+                        leftOpen = true
                     }
                 }
                 return completed
@@ -3410,6 +4430,10 @@ final class KeystrokeTyper {
             emit(chunk, source: source, to: job.target.pid)
             completed += 1
             InputActivity.noteInput()
+            if case .escape = chunk {
+                followsEscape = true
+                continue
+            }
             usleep(job.perCharacter ? 20_000 : 2_000)
         }
         return completed
@@ -3460,7 +4484,7 @@ final class KeystrokeTyper {
 
     // 后台队列：在虚拟机、远程桌面里逐个按键。它们按 flagsChanged 事件判断 ⇧ 有没有按着（只在按键事件上带 ⇧ 标记不够），
     // 所以真的按下、松开 ⇧ 键，并且 ⇧ 前后、按键之间稍作停顿（太快会丢键或者被当成按住不放、自动重复）。返回按下的键数
-    private func pressKeys(_ strokes: [KeyStroke], for job: Job) -> Int {
+    private func pressKeys(_ strokes: [KeyStroke], for job: Job, progress: ((Int) -> Void)? = nil) -> Int {
         let source = CGEventSource(stateID: .privateState)
         // 左 ⇧ 的设备位（NX_DEVICELSHIFTKEYMASK）：有的客户端按它判断是按下还是松开
         let shiftFlags = CGEventFlags(rawValue: CGEventFlags.maskShift.rawValue | 0x2)
@@ -3488,7 +4512,12 @@ final class KeystrokeTyper {
             }
         }
         var completed = 0
+        var reportedAt = Date()
         for stroke in strokes {
+            if let progress, Date().timeIntervalSince(reportedAt) >= 0.1 {
+                progress(completed)
+                reportedAt = Date()
+            }
             let watchers = keystrokeWatchersBlockingTyping(into: job.target.pid, postedAt: .cgSessionEventTap, fresh: true)
             if watchers != nil {
                 watchersStoppedTyping = watchers
@@ -3524,17 +4553,51 @@ final class KeystrokeTyper {
 
     // 系统报告的键盘焦点是否仍是这个输入框（任意线程可用）。不用 NSWorkspace：Spotlight 这类浮动面板拿着焦点时，
     // 前台 App 是下面那个。只在有明确证据（换了进程、换了元素）时才算不是；读不到时稍后重试一次。
+    // 主线程：⌘X 按出 Backspace 之后确认字符数少了。用户之后又打了字就不下结论
+    private static func confirmCut(_ target: FocusedTarget, lengthBefore: Int, deletedAt: Date, deadline: Date = Date().addingTimeInterval(1.2)) {
+        if let length = target.numberOfCharacters, length < lengthBefore {
+            notifyProtected("Cut safely")
+            return
+        }
+        if InputActivity.lastInput > deletedAt {
+            notifyCopiNotice("Copi copied the text, but isn't sure it was deleted from \(target.applicationName). Check before cutting again.")
+            return
+        }
+        guard Date() < deadline else {
+            notifyCopiNotice("Copi copied the text but couldn't delete it in \(target.applicationName). Delete it yourself if you meant to cut it.")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            confirmCut(target, lengthBefore: lengthBefore, deletedAt: deletedAt, deadline: deadline)
+        }
+    }
+
     private static func focusMatches(_ job: Job) -> Bool {
         for attempt in 0..<2 {
             if attempt > 0 {
                 usleep(30_000)
             }
             var value: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute as CFString, &value) == .success,
-                  let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
-                continue
+            let focused: AXUIElement
+            if AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute as CFString, &value) == .success,
+               let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
+                focused = value as! AXUIElement
+            } else {
+                // 系统查不到焦点（Brave 在最前面时会报 kAXErrorNoValue）：和 focusedTarget() 一样退回激活的 App，但只认目标 App 自己、
+                // 只认它报出的焦点正是目标控件。密码框还要系统记下的 Secure Input 正是它开的（排除系统的认证窗口拿着键盘）
+                guard NSWorkspace.shared.runningApplications.first(where: { $0.isActive })?.processIdentifier == job.target.pid else {
+                    return false
+                }
+                if job.target.isSecureTextField, SecureInputOwner.pid != job.target.pid {
+                    continue
+                }
+                var appValue: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(job.target.pid), kAXFocusedUIElementAttribute as CFString, &appValue) == .success,
+                      let appValue, CFGetTypeID(appValue) == AXUIElementGetTypeID() else {
+                    continue
+                }
+                focused = appValue as! AXUIElement
             }
-            let focused = value as! AXUIElement
             var focusedPID: pid_t = 0
             guard AXUIElementGetPid(focused, &focusedPID) == .success, focusedPID == job.target.pid else {
                 return false
@@ -3553,6 +4616,124 @@ final class KeystrokeTyper {
         return false
     }
 
+}
+
+// Copi 在屏幕下方显示的小窗口：要打一阵子的键入显示打到哪里了、按 Esc 停下；要用户再按一次确认的提醒也显示在这里——系统通知可能被
+// 关掉、被勿扰模式挡住，这里一定看得到。不激活 Copi、拿不到焦点（按键要一直打在原来的输入框里），鼠标点不到（点击会让键入停下），
+// 也不出现在屏幕共享和录屏里。不显示复制的文字
+final class CopiHUD {
+    static let shared = CopiHUD()
+
+    private let width: CGFloat = 420
+    private var panel: NSPanel?
+    private let label = NSTextField(wrappingLabelWithString: "")
+    private let bar = NSProgressIndicator()
+    // 每次显示加一：晚到的更新、隐藏不影响后来的那一次
+    private var generation = 0
+
+    // 主线程：显示键入的进度。返回这一次的编号
+    func showProgress(appName: String, total: Int) -> Int {
+        dispatchPrecondition(condition: .onQueue(.main))
+        bar.minValue = 0
+        bar.maxValue = Double(max(total, 1))
+        bar.doubleValue = 0
+        return present("Copi is typing into \(appName). Press Esc to stop.", showsBar: true)
+    }
+
+    // 显示一段说明，seconds 秒后自己消失（任意线程：不在主线程时排到主线程上）
+    func showMessage(_ text: String, seconds: TimeInterval) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [self] in
+                showMessage(text, seconds: seconds)
+            }
+            return
+        }
+        let shown = present(text, showsBar: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            self?.hide(generation: shown)
+        }
+    }
+
+    func update(_ done: Int, generation: Int) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard generation == self.generation else {
+            return
+        }
+        bar.doubleValue = Double(done)
+    }
+
+    func hide(generation: Int) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard generation == self.generation else {
+            return
+        }
+        panel?.orderOut(nil)
+    }
+
+    private func present(_ text: String, showsBar: Bool) -> Int {
+        generation += 1
+        let panel = self.panel ?? makePanel()
+        self.panel = panel
+        label.stringValue = text
+        bar.isHidden = !showsBar
+        panel.contentView?.layoutSubtreeIfNeeded()
+        let height = max(44, (panel.contentView?.fittingSize.height ?? 62))
+        panel.setContentSize(NSSize(width: width, height: height))
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main ?? NSScreen.screens.first
+        if let visible = screen?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x: visible.midX - width / 2, y: visible.minY + 80))
+        }
+        panel.orderFrontRegardless()
+        return generation
+    }
+
+    private func makePanel() -> NSPanel {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: 62), styleMask: [.nonactivatingPanel, .borderless],
+                            backing: .buffered, defer: true)
+        panel.level = .statusBar
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.ignoresMouseEvents = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.sharingType = .none
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
+        // 深色的 HUD 底：浅色外观下文字也要是浅色的
+        panel.appearance = NSAppearance(named: .darkAqua)
+        let background = NSVisualEffectView(frame: panel.contentLayoutRect)
+        background.material = .hudWindow
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 12
+        background.layer?.masksToBounds = true
+        background.autoresizingMask = [.width, .height]
+        label.font = .systemFont(ofSize: 13)
+        label.preferredMaxLayoutWidth = width - 32
+        bar.style = .bar
+        bar.isIndeterminate = false
+        let stack = NSStackView(views: [label, bar])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.detachesHiddenViews = true
+        background.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: background.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            bar.widthAnchor.constraint(equalToConstant: width - 32),
+            label.widthAnchor.constraint(equalToConstant: width - 32),
+        ])
+        panel.contentView = background
+        return panel
+    }
 }
 
 // 当前输入源是不是 ASCII 键盘布局（ABC、U.S. 等）。是拼音、日文这类输入法时，模拟键入的字符会被输入法拿去组字，
@@ -4197,17 +5378,23 @@ func notifyCopiNotice(_ body: String, offering app: RefusedApp? = nil) {
     UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "copi.notice.\(body.hashValue)", content: content, trigger: nil))
 }
 
-// 主线程：异步的路线（终端的脚本接口）最后没能粘贴。允许剪贴板回退、焦点还在那里、用户也没有接着操作时，退回剪贴板方式；否则拒绝
+// 主线程：异步的路线（终端的脚本接口）最后没能粘贴。焦点还在那里、用户也没有接着操作时，退回剪贴板方式（默认不允许剪贴板回退时，
+// 先问用户：8 秒内再粘贴一次才退回，见 ClipboardPasteConsent）；否则拒绝
 func refuseOrFallBack(_ reason: UnavailableReason, text: String, target: FocusedTarget, keyTime: Date) {
     dispatchPrecondition(condition: .onQueue(.main))
-    if !ZeroExposurePolicy.isStrict, reason.allowsClipboardFallback, !userActedSince(keyTime), focusedApplication()?.processIdentifier == target.pid {
+    if reason.allowsClipboardFallback, !userActedSince(keyTime), focusedApplication()?.processIdentifier == target.pid {
+        if ZeroExposurePolicy.isStrict, ClipboardPasteConsent.needsConfirmation(text, targetPID: target.pid, element: target.element, keyTime: keyTime) {
+            let app = RefusedApp(target: target)
+            notifyPasteRefused(reason, app: app, suffix: ClipboardPasteConsent.offer(appName: app.name), prompts: true)
+            return
+        }
         // 有会把本机剪贴板同步出去的 App 在运行：先提醒
-        if let syncReason = remoteClipboardConfirmationBeforeFallback(text, targetPID: target.pid) {
+        if let syncReason = remoteClipboardConfirmationBeforeFallback(text, targetPID: target.pid, keyTime: keyTime) {
             notifyPasteRefused(syncReason, app: RefusedApp(target: target))
             return
         }
         TransientPaste.shared.stage(text, restorePrevious: false, for: target.pid)
-        postPasteKeystroke()
+        GlobalMode.shared.postFallbackPaste()
         return
     }
     notifyPasteRefused(reason, app: RefusedApp(target: target))
@@ -4230,8 +5417,8 @@ enum ConcealedDestinationGuard {
     static var confirmation = PasteConfirmation()
     private static let launcherBundleIDs: Set<String> = ["com.apple.Spotlight", "com.raycast.macos", "com.runningwithcrayons.Alfred"]
 
-    // 主线程：要提醒时返回 true（这一次不粘贴）
-    static func needsConfirmation(_ text: String, concealed: Bool, into target: FocusedTarget) -> Bool {
+    // 主线程：要提醒时返回 true（这一次不粘贴）。keyTime：这一次按键按下的时刻（见 PasteConfirmation）
+    static func needsConfirmation(_ text: String, concealed: Bool, into target: FocusedTarget, keyTime: Date) -> Bool {
         guard concealed, !target.isSecureTextField, !ZeroExposurePolicy.isPasswordManager(target.bundleIdentifier) else {
             return false
         }
@@ -4250,12 +5437,16 @@ enum ConcealedDestinationGuard {
             && ((isChromiumApp(pid: target.pid) && !isElectronApp(pid: target.pid)) || isGeckoApp(pid: target.pid, bundleIdentifier: target.bundleIdentifier))
         let fieldRole = role == kAXTextFieldRole || role == kAXComboBoxRole
         // 地址栏：浏览器自己界面上的输入框（不在网页内容里）。只按内核认出来的浏览器要一直找到窗口都没有网页内容才算
-        let isAddressBar = fieldRole && ((listed && !target.hasWebAreaAncestor) || (byEngine && reachesWindowOutsideWebArea(target.element)))
+        // 网页里嵌套很深的输入框（网页根节点在 hasWebAreaAncestor 找的 10 层之外）：往上一直找得到 http(s) 网页就不是地址栏。
+        // 浏览器自己画成网页的界面（Vivaldi 的 chrome-extension://、vivaldi://）、读不到时照样当作地址栏
+        let inContentPage = { target.webPageURL.map { ["http", "https"].contains($0.scheme?.lowercased() ?? "") } ?? false }
+        let isAddressBar = fieldRole && ((listed && !target.hasWebAreaAncestor && !inContentPage())
+                                         || (byEngine && reachesWindowOutsideWebArea(target.element)))
         let isSearchField = copyAXAttribute(target.element, kAXSubroleAttribute) as? String == "AXSearchField"
         guard isAddressBar || isSearchField || launcherBundleIDs.contains(bundleID) else {
             return false
         }
-        return confirmation.needsConfirmation(key: "\(target.pid)\u{0}\(text)")
+        return confirmation.needsConfirmation(key: "\(target.pid)\u{0}\(text)", keyTime: keyTime)
     }
 }
 
@@ -4289,13 +5480,13 @@ enum BrowserToTerminalGuard {
     // 主线程
     static var confirmation = PasteConfirmation()
 
-    // 主线程：要提醒时返回来源 App 的名字（这一次不粘贴）；用户已经确认过、或者不需要提醒时返回 nil
-    static func unconfirmedSource(of text: String, into target: FocusedTarget) -> String? {
+    // 主线程：要提醒时返回来源 App 的名字（这一次不粘贴）；用户已经确认过、或者不需要提醒时返回 nil。keyTime：这一次按键按下的时刻
+    static func unconfirmedSource(of text: String, into target: FocusedTarget, keyTime: Date) -> String? {
         guard target.bundleIdentifier == "com.apple.Terminal",
               ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 26, minorVersion: 4, patchVersion: 0)),
               SecureClipboard.shared.text == text, let source = SecureClipboard.shared.source,
               browserBundleIDPrefixes.contains(where: { source.hasPrefix($0) }),
-              confirmation.needsConfirmation(key: text) else {
+              confirmation.needsConfirmation(key: text, keyTime: keyTime) else {
             return nil
         }
         let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: source)
@@ -4303,35 +5494,51 @@ enum BrowserToTerminalGuard {
     }
 }
 
-// 用户亲手发起的粘贴（⌘V 按下的那一下、菜单里的粘贴、Copi 的粘贴快捷键、Action Bar）最近一次的时刻。按住 ⌘V 不放产生的自动重复
-// 不算：它不能当作"再粘贴一次"的确认。event tap 线程和主线程都会写
+// 用户亲手发起的粘贴（⌘V 按下的那一下、菜单里的粘贴、Copi 的粘贴快捷键、Action Bar）最近几次按下的时刻（就是一路传给粘贴处理的
+// 那个 keyTime，确认时据此认出是哪一次按键）。按住 ⌘V 不放产生的自动重复不算：它不能当作"再粘贴一次"的确认。
+// event tap 线程和主线程都会写
 enum PastePress {
     private static let lock = NSLock()
-    private static var lastDeliberate = Date.distantPast
+    private static var recent: [Date] = []
 
     static func noteDeliberate(at time: Date) {
         lock.lock()
-        lastDeliberate = max(lastDeliberate, time)
+        recent.append(time)
+        if recent.count > 8 {
+            recent.removeFirst()
+        }
         lock.unlock()
     }
 
-    static var lastDeliberateAt: Date {
+    // keyTime 这一次按键是不是用户亲手按的
+    static func wasDeliberate(_ keyTime: Date) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return lastDeliberate
+        return recent.contains(keyTime)
     }
 }
 
-// "8 秒内再粘贴一次确认"的提醒（主线程）。提醒之后用户亲手再粘贴一次才算确认；确认之后到期之前一直有效——同一次粘贴可能还要
-// 过另一道提醒，不能因为那一道这次没过，这一道就又要从头来（异步的路线晚一点才回来，也一样）
+// 提醒出现之后，再按一次要隔这么久才算确认（秒）
+let confirmationDelay: TimeInterval = 0.6
+
+// "8 秒内再粘贴一次确认"的提醒（主线程）。提醒之后用户亲手再粘贴一次才算确认：看的是这一次按键本身，在别处亲手按过的不算。
+// 确认之后一直有效，用户每亲手粘贴一次再延长 8 秒——同一次粘贴可能还要过另一道提醒，不能因为那一道这次没过，这一道就又要从头来
+//（异步的路线晚一点才回来，也一样）；这期间每一次也都要是用户亲手按的，不是亲手按的不算、也不延长
 struct PasteConfirmation {
     private var pending: (key: String, armedAt: Date, until: Date)?
 
-    // 返回 true 表示这一次只提醒、不粘贴
-    mutating func needsConfirmation(key: String) -> Bool {
+    // keyTime：这一次按键按下的时刻。返回 true 表示这一次只提醒、不粘贴
+    mutating func needsConfirmation(key: String, keyTime: Date) -> Bool {
         let now = Date()
-        if let current = pending, current.key == key, now < current.until {
-            guard PastePress.lastDeliberateAt > current.armedAt else {
+        // 窗口看的是按下的时刻：8 秒内按下、走异步的路线（终端的脚本接口、tmux、Neovim）晚一点才回来的，也算在窗口内
+        if let current = pending, current.key == key, keyTime < current.until {
+            // 提醒出现之后至少过了一小会儿、用户亲手按下的才算：手快连按两下、按住不放、硬件层刚才没记下按键时别的程序发来的按键都不是
+            // 看过提醒之后的确认（是不是亲手按的只能推测，见 hardwareInput）
+            guard keyTime > current.armedAt.addingTimeInterval(confirmationDelay), PastePress.wasDeliberate(keyTime) else {
+                // 窗口这时已经过了：和以前一样从头再来，这次显示的提醒才对得上一个有效的窗口
+                if now >= current.until {
+                    pending = (key, now, now.addingTimeInterval(8))
+                }
                 return true
             }
             // 确认过了：再保持 8 秒（另一道提醒这次没过时，用户读完它再粘贴，这一道不能已经过期又要从头来）
@@ -4349,16 +5556,141 @@ enum RemoteClipboardGuard {
     static var confirmation = PasteConfirmation()
 }
 
+// 默认（不允许剪贴板回退）时，没有不经过剪贴板的办法的粘贴：第一次说明为什么、要经过剪贴板，8 秒内用户亲手再粘贴一次才经过
+// 剪贴板粘贴（和打开 Allow Clipboard Fallback 时一样：按需提供、带不记录的标记、只留在本机、读走就撤下，最多 3 秒）
+enum ClipboardPasteConsent {
+    // 主线程
+    static var confirmation = PasteConfirmation()
+
+    // 主线程：要先问用户时返回 true（这一次不粘贴）。有会把本机剪贴板同步出去的 App 在运行时不在这里问：接下来那道提醒
+    // （remoteClipboardConfirmationBeforeFallback）一样要用户再粘贴一次，说得也更清楚，不必连问两次
+    // element：要粘贴进的控件（读不到时为 nil）。换了控件要重新问：在一个输入框里确认过，不等于在另一个里也同意
+    // keyTime：这一次按键按下的时刻（见 PasteConfirmation）
+    static func needsConfirmation(_ text: String, targetPID: pid_t?, element: AXUIElement?, keyTime: Date) -> Bool {
+        guard runningClipboardSyncers().isEmpty else {
+            return false
+        }
+        return confirmation.needsConfirmation(key: "\(targetPID ?? -1)\u{0}\(element.map { CFHash($0) } ?? 0)\u{0}\(text)", keyTime: keyTime)
+    }
+
+    // 拒绝通知后面接的这一句
+    static func offer(appName: String) -> String {
+        " \(pasteAgain) within 8 seconds to paste it through the clipboard instead: it stays there only until \(appName) reads it (3 seconds at most), marked so clipboard managers don't record it, though other apps could read it in that time."
+    }
+
+    // 怎样"再粘贴一次"。Override 模式之外 ⌘V 不归 Copi 处理：照着按 ⌘V，App 会原生粘贴系统剪贴板上更早的内容，这次也确认不了，
+    // 要再按 Safe Paste 的快捷键、再点 Action Bar 的 Paste（用户把快捷键清掉、关掉 Action Bar 时不提它）
+    private static var pasteAgain: String {
+        if GlobalMode.shared.isInterceptingKeys {
+            return "Press ⌘V again"
+        }
+        // Override 开着、拦截器却没起来（菜单栏显示暂停）：⌘V 同样不归 Copi 处理，Safe Paste 的快捷键这时也是关着的
+        if GlobalMode.shared.isOverrideActive {
+            return Defaults[.showQuickActions] ? "Click Paste in the Action Bar again" : "Paste again"
+        }
+        switch (KeyboardShortcuts.getShortcut(for: .safePaste), Defaults[.showQuickActions]) {
+        case let (shortcut?, true):
+            return "Press \(shortcut) (Safe Paste) again or click Paste in the Action Bar again"
+        case let (shortcut?, false):
+            return "Press \(shortcut) (Safe Paste) again"
+        case (nil, true):
+            return "Click Paste in the Action Bar again"
+        case (nil, false):
+            return "Paste again with Safe Paste"
+        }
+    }
+}
+
+// 用户亲手按下的复制（⌘C/⌘X 按下的那一下、菜单里的拷贝/剪切、Copi 的复制快捷键）最近几次按下的时刻（见 PastePress）。
+// 按住不放的自动重复不算
+enum CopyPress {
+    private static let lock = NSLock()
+    private static var recent: [Date] = []
+
+    static func noteDeliberate(at time: Date) {
+        lock.lock()
+        recent.append(time)
+        if recent.count > 8 {
+            recent.removeFirst()
+        }
+        lock.unlock()
+    }
+
+    // keyTime 这一次按键是不是用户亲手按的
+    static func wasDeliberate(_ keyTime: Date) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return recent.contains(keyTime)
+    }
+}
+
+// Copi 读不出选中的内容时：第一次说明为什么，8 秒内用户在同一个地方亲手再复制一次，才交给 App 自己复制（文字会出现在系统剪贴板上，
+// Copi 在几毫秒内把它转进来；macOS 读之前要先问时，要等用户回答之后，见 offer）。有会把本机剪贴板同步出去的 App 在运行时，
+// 说明里一并告诉用户（和粘贴时 remoteClipboardConfirmationBeforeFallback 一样，确认的这一次就是在知道这一点之后）。主线程
+enum CopyThroughAppConsent {
+    private static var pending: (key: String, armedAt: Date, until: Date)?
+
+    // keyTime：这一次按键按下的时刻。返回 true 表示这一次只提醒、不复制
+    static func needsConfirmation(pid: pid_t?, element: AXUIElement?, cut: Bool, keyTime: Date) -> Bool {
+        // 会把本机剪贴板同步出去的 App 和提醒时不一样了（例如提醒之后才打开的虚拟机）：用户确认时不知道有它，要重新问
+        let syncers = runningClipboardSyncers().joined(separator: "\u{0}")
+        let key = "\(pid ?? -1)\u{0}\(cut)\u{0}\(element.map { CFHash($0) } ?? 0)\u{0}\(syncers)"
+        let now = Date()
+        // 窗口看的是按下的时刻（见 PasteConfirmation）
+        if let current = pending, current.key == key, keyTime < current.until {
+            // 提醒出现之后至少过了一小会儿、用户亲手按下的这一次才算（见 PasteConfirmation）
+            guard keyTime > current.armedAt.addingTimeInterval(confirmationDelay), CopyPress.wasDeliberate(keyTime) else {
+                if now >= current.until {
+                    pending = (key, now, now.addingTimeInterval(8))
+                }
+                return true
+            }
+            pending = nil
+            return false
+        }
+        pending = (key, now, now.addingTimeInterval(8))
+        return true
+    }
+
+    // 交给 App 自己复制之后 Copi 要能读到它写进来的文字：macOS 不让 Copi 读时不提供；设成读之前要先问时，剪切也不提供——
+    // 文字会在系统剪贴板上等用户回答，用户拒绝的话这次复制就没了，剪切的原文却已经删掉了
+    static func isAvailable(cut: Bool) -> Bool {
+        switch SystemClipboardFeatures.cachedPasteboardAccess {
+        case .denied:
+            return false
+        case .ask:
+            return !cut
+        case .allowed:
+            return !cut || !SystemClipboardFeatures.cachedMayPrompt
+        }
+    }
+
+    static func offer(appName: String, cut: Bool) -> String {
+        let syncers = runningClipboardSyncers()
+        let synced = syncers.isEmpty ? "" : ", and \(ListFormatter.localizedString(byJoining: Array(syncers.prefix(3)))) can copy it to another computer's clipboard (and its clipboard history), where it stays"
+        // macOS 读之前可能先问（设成询问，或者还没问过）：Copi 要等用户回答才读得到，文字这期间一直不带标记地留在系统剪贴板上
+        //（这时只提供复制，见 isAvailable）。用户不允许时，默认设置下 Copi 把它清掉；允许剪贴板回退时它照旧留着
+        guard SystemClipboardFeatures.cachedPasteboardAccess == .ask || SystemClipboardFeatures.cachedMayPrompt else {
+            return " Press \(cut ? "⌘X" : "⌘C") again within 8 seconds to let \(appName) \(cut ? "cut" : "copy") it itself: the text then sits on the system clipboard, where other apps could read it, for the few milliseconds until Copi moves it in\(synced)."
+        }
+        let denied = ZeroExposurePolicy.isStrict ? "Copi removes the text and nothing is copied" : "the text stays on the clipboard"
+        return " Press \(cut ? "⌘X" : "⌘C") again within 8 seconds to let \(appName) \(cut ? "cut" : "copy") it itself: the text then sits on the system clipboard, unmarked, where other apps could read it, until Copi moves it in, and if macOS asks whether Copi may read it, until you answer\(synced). If macOS asks and you don't allow it, \(denied)."
+    }
+}
+
 // 粘贴进放行的 App 被拒绝时补一句（放行只让那个 App 自己复制的文字留在系统剪贴板上）
 let normalClipboardPasteNote = " Text copied in other apps stays off the clipboard, even in apps that use the normal clipboard."
 
-// suffix：追加在说明后面的话。粘贴被拒绝时不提供"这个 App 照常使用系统剪贴板"的按钮：放行只影响在那个 App 里的复制，帮不了这次粘贴
-func notifyPasteRefused(_ reason: UnavailableReason, app: RefusedApp, suffix: String = "") {
+// suffix：追加在说明后面的话。粘贴被拒绝时不提供"这个 App 照常使用系统剪贴板"的按钮：放行只影响在那个 App 里的复制，帮不了这次粘贴。
+// prompts：要用户再粘贴一次确认（说明同时显示在屏幕下方，见 CopiHUD）
+func notifyPasteRefused(_ reason: UnavailableReason, app: RefusedApp, suffix: String = "", prompts: Bool = false) {
     let name = app.name
     let body: String
     switch reason {
     case .noRoute:
         body = "\(name) has no way to paste without the system clipboard, so Copi pasted nothing."
+    case .lineTooLong(let limit):
+        body = "The prompt in \(name), such as a password prompt or a script asking for input, takes only about \(limit) bytes on one line and silently drops the rest, even when pasted in parts, so Copi pasted nothing. Characters outside ASCII (accented letters, curly quotes, Chinese, emoji) take 2 to 4 bytes each."
     case .multiLine:
         body = "Copi can only paste single lines into \(name) without the system clipboard, so it pasted nothing."
     case .inputMethod:
@@ -4370,6 +5702,8 @@ func notifyPasteRefused(_ reason: UnavailableReason, app: RefusedApp, suffix: St
         body = "\(name) is running \(program), which could treat pasted text as commands, so Copi pasted nothing."
     case .modalProgram(nil):
         body = "Copi can't tell what is running in \(name), which could treat pasted text as commands, so it pasted nothing. Copi types into terminals only at a shell prompt."
+    case .formattingTriggers:
+        body = "\(name) turns some typed text into formatting (a line starting with \"- \", \"# \", \"> \" or \"1. \" becomes a list, heading or quote; :name: becomes an emoji), which would change this text, so Copi pasted nothing."
     case .unsafeCharacters:
         body = "\(name) would auto-complete brackets, quotes or punctuation in this text, so Copi pasted nothing. Without the clipboard Copi can only paste letters, digits and simple symbols there."
     case .untypeableCharacters:
@@ -4378,6 +5712,10 @@ func notifyPasteRefused(_ reason: UnavailableReason, app: RefusedApp, suffix: St
         body = "Turn off Caps Lock and press ⌘V again: Copi pastes into \(name) by pressing keys, and Caps Lock would change the letters."
     case .viMode:
         body = "The shell in \(name) may be using vi key bindings, where pasted letters could act as commands, so Copi pasted nothing."
+    case .shellAbbreviations:
+        body = "fish in \(name) has abbreviations, which typed spaces or ; | & would expand into other commands, so Copi pasted nothing."
+    case .singleKeyPrompt:
+        body = "\(name) is waiting for a single key (such as a y/n answer), which the first character of the paste would answer, so Copi pasted nothing."
     case .concealedIntoSearch:
         body = "This looks like a password or secret from a password manager, and the focus in \(name) is in an address bar or search field, which can send what you paste to a search service right away. Paste again within 8 seconds to paste it there anyway."
     case .tmuxHooks(let hooks):
@@ -4390,8 +5728,21 @@ func notifyPasteRefused(_ reason: UnavailableReason, app: RefusedApp, suffix: St
     case .keystrokesWatched(let watchers):
         let names = ListFormatter.localizedString(byJoining: Array(watchers.prefix(3)))
         body = "Copi would paste into \(name) by typing, and \(names) can see keystrokes, so it pasted nothing. Turn off Don't Type When Keystrokes Are Watched in Copi's menu to type anyway."
+    case .stillTyping:
+        // 不是这里没法粘贴：不补充怎样才能在这里粘贴的说明
+        notifyCopiNotice("Copi was still typing the previous paste into \(name) when you pasted again, so it pasted nothing this time. The previous paste may have stopped part way: check the field, then paste again.")
+        return
     }
-    notifyCopiNotice(body + suffix + app.hint(forPasteRefusal: reason))
+    let message = body + suffix + app.hint(forPasteRefusal: reason)
+    notifyCopiNotice(message)
+    switch reason {
+    case .concealedIntoSearch, .remoteClipboard, .needsConfirmation:
+        CopiHUD.shared.showMessage(message, seconds: 8)
+    default:
+        if prompts {
+            CopiHUD.shared.showMessage(message, seconds: 8)
+        }
+    }
 }
 
 // 为什么拒绝了一次复制
@@ -4406,7 +5757,8 @@ enum CopyRefusal {
     case multipleSelections
 }
 
-func notifyCopyRefused(app: RefusedApp, cut: Bool, reason: CopyRefusal) {
+// offerApp：再复制一次就交给 App 自己复制（见 CopyThroughAppConsent）
+func notifyCopyRefused(app: RefusedApp, cut: Bool, reason: CopyRefusal, offerApp: Bool = false) {
     let verb = cut ? "cut" : "copied"
     let body: String
     switch reason {
@@ -4420,8 +5772,17 @@ func notifyCopyRefused(app: RefusedApp, cut: Bool, reason: CopyRefusal) {
         body = "Copi can't \(cut ? "cut" : "copy") several selections at once without the system clipboard, so nothing was \(verb). Do them one at a time."
     }
     let suffix = " Copi also cleared its clipboard so a paste won't insert something older."
+        + (offerApp ? CopyThroughAppConsent.offer(appName: app.name, cut: cut) : "")
+    if offerApp {
+        CopiHUD.shared.showMessage(body + CopyThroughAppConsent.offer(appName: app.name, cut: cut), seconds: 8)
+    }
+    // "照常使用系统剪贴板"的按钮只在放行确实有用、又不会让文字流到别处时提供。Copi 太忙（或编辑器没及时回应）：问题不在这个 App
+    // 用不用系统剪贴板。虚拟机、远程桌面：系统剪贴板会被它们同步到客户机（远程电脑）上、留在那里，Copi 撤不下来；
+    // 改为告诉用户在客户机里复制用的是客户机的剪贴板
     if case .busy = reason {
         notifyCopiNotice(body + suffix)
+    } else if isRemoteDesktopApp(app.bundleID) {
+        notifyCopiNotice(body + suffix + " Copying inside the guest (for example with Ctrl+C in Windows) uses the guest's clipboard, which \(app.name) can share with this Mac.")
     } else {
         notifyCopiNotice(body + suffix + app.hint(forPasteRefusal: nil), offering: app)
     }

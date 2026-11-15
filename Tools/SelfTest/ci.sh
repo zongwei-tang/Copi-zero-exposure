@@ -8,7 +8,7 @@ cd "$ROOT"
 OUT="$ROOT/build/selftest"
 COPI_APP="$ROOT/build/DD/Build/Products/Release/Copi.app"
 TEST_APP="$OUT/CopiSelfTest.app"
-TEST_GROUPS="${SELFTEST_GROUPS:-basic,browsers,browsermore,terminal,sudo,guard,iterm,vm,vscode,concealed}"
+TEST_GROUPS="${SELFTEST_GROUPS:-basic,browsers,browsermore,terminal,sudo,guard,iterm,vm,vscode,matrix,concealed}"
 
 # 运行环境记进 ci-env.log（和报告一起上传）
 exec > >(tee "$OUT/ci-env.log") 2>&1

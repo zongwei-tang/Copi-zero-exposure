@@ -5,9 +5,11 @@
 //  终端自己的接口：把要粘贴的文字直接交给终端进程——不经过剪贴板，也不经过键盘事件（能看到按键的程序看不到它，
 //  拼音开着也不用临时切换），整段一次写进终端，没有逐个按键的时序问题（fish 也能多行粘贴）。
 //   - iTerm2（Apple Event 的 write text）：原样写进终端。和键入一样，Copi 先确认终端停在 shell 提示符前，多行文字自己包上
-//     bracketed paste 的标记；
+//     bracketed paste 的标记。tmux 整合（tmux -CC）的会话里不送（write text 会变成 tmux 的命令）；
 //   - Ghostty 1.3 起（Apple Event 的 input text）、WezTerm（它本地 socket 上的 SendPaste，和它自己的 ⌘V 走同一段代码）、
-//     kitty（远程控制的 send-text）：和真正的粘贴一样由终端决定加不加标记，所以终端里运行着 Vim 时也能粘贴单行文字。
+//     kitty（远程控制的 send-text）：和真正的粘贴一样由终端决定加不加标记，所以终端里运行着 Vim 时也能粘贴单行文字
+//     （Vim 自己的终端窗口里运行着程序时除外）。
+//  焦点所在的程序不在提示符前、而是在按行读（Python 的 input()、ssh 问密码）时，单行文字照模拟键入的规则键入（见 typeIntoLineReader）。
 //  iTerm2、Ghostty 需要用户允许 Copi 控制它们（系统设置 › 隐私与安全性 › 自动化；在 Copi 的设置里点一下会弹出系统的询问），
 //  没有允许时不弹询问，照旧模拟键入。WezTerm 什么都不用设置。kitty 默认关着远程控制，用户在 kitty.conf 里打开之后才能用
 //  （见 README；Copi 不替用户改：打开之后同一用户的别的程序也能往 kitty 里送文字）。
@@ -188,6 +190,15 @@ enum TerminalScript {
         // 读不出焦点所在终端会话的 tty 时（Ghostty 1.3）只能看所有标签页
         let allGroups = script == .ghostty ? terminalForegroundGroups(of: target) : nil
         queue.async {
+            // iTerm2 的 tmux 整合（tmux -CC）：整合开出来的会话没有本机的终端设备，write text 由 iTerm2 变成 tmux 的命令送过去
+            // （tmux 把执行过的命令连同参数记进消息记录），运行 tmux -CC 的会话收到的文字本身就是 tmux 的命令。先问 iTerm2
+            // 焦点所在的会话是不是；问不到时看进程树，开着整合就不送（看不出焦点在不在整合开出来的会话上）
+            if script == .iTerm2, script.focusedSessionIsInTmuxIntegration(pid: pid) ?? iTermTmuxIntegrationIsRunning(pid: pid) {
+                DispatchQueue.main.async {
+                    refuseOrFallBack(.modalProgram("tmux"), text: text, target: target, keyTime: keyTime)
+                }
+                return
+            }
             let terminal: (tty: String?, windowName: String?)
             do {
                 terminal = try script.focusedTerminal(pid: pid)
@@ -212,7 +223,7 @@ enum TerminalScript {
                 payload = value
             case .failure(let reason):
                 DispatchQueue.main.async {
-                    refuseOrFallBack(reason, text: text, target: target, keyTime: keyTime)
+                    refuse(reason, focusedGroup: focusedGroup, text: text, target: target, keyTime: keyTime)
                 }
                 return
             }
@@ -241,6 +252,22 @@ enum TerminalScript {
             }
         }
         return true
+    }
+
+    // 主线程：要送进焦点所在终端会话的内容被拒绝了（reason）。拒绝是因为那里的程序不在提示符前时，它可能在按行读
+    // （Python 的 input()、ssh 问密码）：照模拟键入的规则判断，能键入就键入单行文字（见 typeIntoLineReader；文字这时经过按键送进去），
+    // 不能就按那里的规则拒绝。没有本机终端设备的 pane、tmux 整合不走这里：模拟键入看不到里面运行着什么。
+    // focusedGroup：终端说了焦点在哪个会话时，那个会话的前台进程组（kitty、读不到终端设备的 Ghostty 为 nil）
+    private static func refuse(_ reason: UnavailableReason, focusedGroup: [ForegroundProcess]?, text: String, target: FocusedTarget, keyTime: Date) {
+        var reason = reason
+        if case .modalProgram(let program) = reason {
+            guard case .unavailable(let refusal) = typeIntoLineReader(text, program: program, target: target, keyTime: keyTime,
+                                                                     focusedGroup: focusedGroup) else {
+                return
+            }
+            reason = refusal
+        }
+        refuseOrFallBack(reason, text: text, target: target, keyTime: keyTime)
     }
 
     // 焦点确实在终端画面上，并且是脚本接口能指到的那个窗口：iTerm2 的终端画面是选中文字不可改写的文本区域；
@@ -281,7 +308,7 @@ enum TerminalScript {
         }
         let shells = group.filter { !terminalPasswordPrograms.contains($0.name) }
         // 停在 sudo 这类的密码提示
-        return terminalPayload(for: text, shells: shells, atPasswordPrompt: shells.count < group.count)
+        return terminalPayload(for: text, shells: shells, atPasswordPrompt: shells.count < group.count, ttys: group.map(\.tty))
     }
 
     // 和真正的粘贴一样由终端决定加不加 bracketed paste 标记的写入（Ghostty 的 input text、WezTerm 的 SendPaste、kitty 的 send-text）。
@@ -311,6 +338,19 @@ enum TerminalScript {
                   !promptShells.contains(where: { shellMayUseViMode(pid: $0.pid) && !shellEnablesBracketedPasteMode(pid: $0.pid) }) else {
                 return .failure(hasControls ? .multiLine : .modalProgram(program))
             }
+            // Vim 在它自己的终端窗口（:terminal）里运行着程序：终端窗口拿着焦点时 Vim 把粘贴的文字转给那个程序（less、另一个 vim 里
+            // 字母是命令）。看不出焦点在 Vim 的哪个窗口、是什么模式：有这样的程序就拒绝；读不出进程表时按看不出在运行什么处理
+            for process in group where bracketedPastePrograms.contains(process.name) {
+                guard let embedded = hasDescendantOnOtherTerminal(process) else {
+                    return .failure(.modalProgram(nil))
+                }
+                if embedded {
+                    return .failure(.modalProgram("a program in \(process.name)'s terminal"))
+                }
+            }
+            if let reason = canonicalLineRefusal(body, ttys: group.map(\.tty), atPasswordPrompt: false) {
+                return .failure(reason)
+            }
             return .success(body)
         }
         // shell 的行编辑器正在读、会打开 bracketed paste 模式：终端会加上标记，shell 整段插入、不执行。
@@ -324,8 +364,17 @@ enum TerminalScript {
             }
             return .success(sanitized)
         }
+        // 在等单个按键（zsh 的 read -q、bash 的 read -n 1）：第一个字符就是回答。sudo 这类在等密码时不看（设了 pwfeedback 的 sudo
+        // 也关掉 canonical 模式）
+        guard atPasswordPrompt || !shells.contains(where: { waitsForSingleKey($0) }) else {
+            return .failure(.singleKeyPrompt)
+        }
         guard !hasControls else {
             return .failure(.multiLine)
+        }
+        // 密码提示、脚本里的 read 这类按行收输入的终端放不下太长的一行
+        if let reason = canonicalLineRefusal(body, ttys: group.map(\.tty), atPasswordPrompt: atPasswordPrompt) {
+            return .failure(reason)
         }
         guard !shells.contains(where: { shellMayUseViMode(pid: $0.pid) }) else {
             return .failure(.viMode)
@@ -373,6 +422,28 @@ enum TerminalScript {
         }
         let windowName = try? Self.get(Self.property("pnam", of: window), pid: pid).stringValue
         return (tty, windowName)
+    }
+
+    // iTerm2：焦点所在的会话属于 tmux 整合（运行着 tmux -CC 的 gateway，或者整合开出来的 client）时为 true，不属于时为 false
+    // （没开整合时 iTerm2 不设 tmuxRole 这个变量）；问不到（旧版 iTerm2 没有这个命令、出错、超时）时为 nil
+    private func focusedSessionIsInTmuxIntegration(pid: pid_t) -> Bool? {
+        guard self == .iTerm2 else {
+            return false
+        }
+        // variable (current session of current window) named "tmuxRole"
+        let event = Self.event("Itrm", "varb", pid: pid)
+        event.setParam(Self.property("Wcsn", of: Self.property("Crwn", of: .null())), forKeyword: Self.directObject)
+        event.setParam(NSAppleEventDescriptor(string: "tmuxRole"), forKeyword: fourCharCode("Namd"))
+        guard let reply = try? Self.send(event, timeout: 0.5) else {
+            return nil
+        }
+        // 没设的变量没有值（missing value）或者是空的；只认文字
+        guard let value = reply.paramDescriptor(forKeyword: Self.directObject),
+              [fourCharCode("utxt"), fourCharCode("utf8"), fourCharCode("TEXT")].contains(value.descriptorType),
+              let role = value.stringValue else {
+            return false
+        }
+        return !role.isEmpty && role != "none"
     }
 
     // 写进终端。tty：发之前再确认一次焦点还在这个终端会话上（读不到 tty 的 Ghostty 确认窗口标题没变）
@@ -488,8 +559,8 @@ extension TerminalScript {
             return false
         }
         // WezTerm 的复制模式、搜索框开着时，它说拿着焦点的仍是下面的 pane，粘贴会落进 shell 而不是搜索框：照旧键入（键入的按键
-        // 会到达搜索框）。它的窗口标题这时以 "Copy mode: " 开头（前面可能有 [Z]、[1/2] 这样的标记）
-        if self == .wezterm, target.focusedWindowTitle.map({ $0.range(of: #"^(\[[^\]]*\] )*Copy mode: "#, options: .regularExpression) != nil }) ?? true {
+        // 会到达搜索框）。只键入单行文字、不包 bracketed paste（开头的 ESC 会关掉它，见 typeIntoTerminalByKeys）
+        if self == .wezterm, target.wezTermOverlayMayBeOpen {
             return false
         }
         Self.queue.async {
@@ -536,7 +607,7 @@ extension TerminalScript {
                 payload = value
             case .failure(let reason):
                 DispatchQueue.main.async {
-                    refuseOrFallBack(reason, text: text, target: target, keyTime: keyTime)
+                    Self.refuse(reason, focusedGroup: script == .wezterm ? group : nil, text: text, target: target, keyTime: keyTime)
                 }
                 return
             }
@@ -715,7 +786,7 @@ extension TerminalScript {
     // MARK: socket
 
     // 连上之后确认对面正是这个终端进程（socket 文件是谁都能在自己的目录里放的，只看文件属主不够）
-    private static func connectUnixSocket(_ path: String, expectedPeer pid: pid_t) -> Int32? {
+    static func connectUnixSocket(_ path: String, expectedPeer pid: pid_t) -> Int32? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             return nil
@@ -749,7 +820,7 @@ extension TerminalScript {
     }
 
     // 写完全部字节（非阻塞，缓冲区满了就等，最多等 timeout）
-    private static func writeAll(_ fd: Int32, _ bytes: [UInt8], timeout: TimeInterval) -> Bool {
+    static func writeAll(_ fd: Int32, _ bytes: [UInt8], timeout: TimeInterval) -> Bool {
         let deadline = DispatchTime.now() + timeout
         var offset = 0
         while offset < bytes.count {
@@ -874,6 +945,15 @@ extension TerminalScript {
     }
 }
 
+extension FocusedTarget {
+    // 焦点在 WezTerm 上，它的复制模式或搜索框可能开着（这时它说拿着焦点的仍是下面的 pane）。它的窗口标题这时以 "Copy mode: " 开头
+    // （前面可能有 [Z]、[1/2] 这样的标记）；读不到标题时按开着处理
+    var wezTermOverlayMayBeOpen: Bool {
+        bundleIdentifier == TerminalScript.wezterm.bundleIdentifier
+            && (focusedWindowTitle.map { $0.range(of: #"^(\[[^\]]*\] )*Copy mode: "#, options: .regularExpression) != nil } ?? true)
+    }
+}
+
 // MARK: - kitty 的远程控制设置
 
 // kitty 默认关着远程控制。Copi 不改用户的 kitty.conf，只在 kitty 的配置目录里放一个检查脚本：不带密码的请求只接受本机 socket 上的
@@ -937,7 +1017,8 @@ enum KittyRemoteControl {
     }
 }
 
-// 一定会打开 bracketed paste 模式的程序（Ghostty 里粘贴给它们的单行文字是插入，不是按键）
+// 一定会打开 bracketed paste 模式的程序（Ghostty 里粘贴给它们的单行文字是插入，不是按键；它们的终端窗口里运行着程序时除外）。
+// Emacs 不在里面：`emacs -nw` 的 vterm、term 同样会把文字转给里面的程序，按别的程序拒绝
 private let bracketedPastePrograms: Set<String> = ["vim", "nvim", "vi", "view", "vimdiff"]
 
 private func fourCharCode(_ code: String) -> FourCharCode {

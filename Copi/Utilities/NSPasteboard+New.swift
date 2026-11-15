@@ -71,6 +71,8 @@ final class SecureClipboard {
     // concealed：密码管理器的复制。它们会在几十秒后自动清掉系统剪贴板上的密码，转移进来之后也要保持同样的语义，
     // 到期自动清除，不能让密码一直留在 Copi 里随处可贴。
     func setText(_ newValue: String?, concealed isConcealed: Bool = false, metadata: EditorPasteMetadata? = nil, source: String? = nil) {
+        // 有了新的文字（或者清空）：更早的不是文字的复制也作废，两样之中只有一样是最新的
+        NonTextClipboard.shared.clear()
         lock.lock()
         storage = (newValue?.isEmpty ?? true) ? nil : newValue
         concealed = isConcealed
@@ -136,6 +138,88 @@ final class SecureClipboard {
 struct EditorPasteMetadata {
     let pasteOnNewLine: Bool
     let multicursorText: [String]?
+}
+
+// 不是文字的复制（图片、文件、App 自己格式的对象）：Copi 从系统剪贴板上整个取下来，存在本进程内存里，粘贴时才短暂放上去
+// （见 TransientPaste.stageItems），不再一直摆在系统剪贴板上让所有 App 读。和 SecureClipboard 里的文字两样之中只有一样是最新的：
+// 存进文字（或者清空）时它也清掉
+final class NonTextClipboard {
+    static let shared = NonTextClipboard()
+
+    // 一项里的每种类型和数据，按原来的顺序
+    typealias Item = [(type: NSPasteboard.PasteboardType, data: Data)]
+
+    private let lock = NSLock()
+    private var storage: [Item]?
+    private var storedSummary: String?
+    private var generation = 0
+
+    var items: [Item]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    var hasContent: Bool {
+        items != nil
+    }
+
+    // 菜单里显示的说明（"An image"、"3 files"）
+    var summary: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage != nil ? storedSummary : nil
+    }
+
+    // 每存一次、清一次都加一（区分"同一份"）
+    var version: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation
+    }
+
+    // 主线程
+    func store(_ items: [Item], summary: String) {
+        SecureClipboard.shared.setText(nil)
+        lock.lock()
+        storage = items
+        storedSummary = summary
+        generation += 1
+        let token = generation
+        lock.unlock()
+        // 和文字一样按用户设置的分钟数到期清除
+        let minutes = Defaults[.autoClearMinutes]
+        if minutes > 0 {
+            DispatchQueue.main.asyncAfter(wallDeadline: .now() + TimeInterval(minutes) * 60) { [weak self] in
+                self?.clear(ifVersion: token)
+            }
+        }
+        postDidChange()
+    }
+
+    // 任意线程
+    func clear() {
+        clear(ifVersion: nil)
+    }
+
+    private func clear(ifVersion token: Int?) {
+        lock.lock()
+        guard storage != nil, token == nil || token == generation else {
+            lock.unlock()
+            return
+        }
+        storage = nil
+        storedSummary = nil
+        generation += 1
+        lock.unlock()
+        postDidChange()
+    }
+
+    private func postDidChange() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: SecureClipboard.didChangeNotification, object: nil)
+        }
+    }
 }
 
 // nspasteboard.org 约定的标记类型，主流剪贴板管理工具（Maccy、Paste、Alfred、Raycast……）都会据此不记录内容
@@ -207,6 +291,49 @@ extension NSPasteboard {
             snapshot.append(copy)
         }
         return snapshot
+    }
+
+    // 不是文字的复制整个取下来（每一项的每一种类型的数据），存进 Copi（见 NonTextClipboard）。读不全就返回 nil——某种类型读不出来、
+    // 太大、要源 App 事后兑现的文件承诺、从别的设备同步来的、Copi 自己挂上去的：宁可照旧留在系统剪贴板上，也不存一份粘贴出来缺东西的。
+    // 跳过旧式的别名类型（系统会从对应的标准类型自动转换）。总共超过 64 MB 的不存
+    func copiNonTextSnapshot(_ items: [NSPasteboardItem]) -> [NonTextClipboard.Item]? {
+        let legacyAliases: Set<String> = [
+            "NSStringPboardType", "NeXT TIFF v4.0 pasteboard type", "Apple PNG pasteboard type", "NSPDFPboardType",
+            "Apple PDF pasteboard type", "NeXT Rich Text Format v1.0 pasteboard type", "NeXT RTFD pasteboard type",
+            "Apple HTML pasteboard type", "NSFilenamesPboardType", "Apple URL pasteboard type", "com.apple.pict",
+        ]
+        let promiseTypes: Set<String> = [
+            "com.apple.pasteboard.promised-file-url", "com.apple.NSFilePromiseItemMetaData", "NSPromiseContentsPboardType",
+            "com.apple.pasteboard.promised-file-content-type", "com.apple.pasteboard.promised-file-name",
+        ]
+        let sizeLimit = 64 * 1024 * 1024
+        var totalSize = 0
+        var snapshot: [NonTextClipboard.Item] = []
+        for item in items {
+            let types = item.types
+            if types.contains(where: { promiseTypes.contains($0.rawValue) || $0 == .universalClipboardRemote || $0.isCopiStaged
+                || $0 == PasteboardOwnership.placeholderType }) {
+                return nil
+            }
+            // 同一张图已经有 PNG/JPEG：TIFF 表示不读（往往是源 App 当场生成的、很大，在主线程上读会卡住）
+            let hasCompactImage = types.contains(.png) || types.contains(NSPasteboard.PasteboardType("public.jpeg"))
+            var entries: NonTextClipboard.Item = []
+            for type in types where !legacyAliases.contains(type.rawValue) && !(hasCompactImage && type == .tiff) {
+                guard let data = item.data(forType: type) else {
+                    return nil
+                }
+                totalSize += data.count
+                guard totalSize <= sizeLimit else {
+                    return nil
+                }
+                entries.append((type, data))
+            }
+            guard !entries.isEmpty else {
+                return nil
+            }
+            snapshot.append(entries)
+        }
+        return snapshot.isEmpty ? nil : snapshot
     }
 
     // 系统剪贴板服务的私有接口（WebKit、Chromium 也在用）：到期后由服务自己清空这次的内容；macOS 26 起还能让它不进 Spotlight 的

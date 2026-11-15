@@ -528,9 +528,15 @@ let axWriteUnreliableBundleIDPrefixes = ["com.jetbrains.", "com.google.android.s
 let axWritableRoles: Set<String> = [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole]
 
 // 把 text 直接写入焦点控件的选区（替换选中内容/在光标处插入），全程不经过系统剪贴板。
-func writeSelectedText(_ text: String, to target: FocusedTarget) -> AXWriteResult {
+// terminalInputField：焦点在终端 App 里的原生输入框（iTerm2 的 Composer），不在终端画面上。终端画面会假装写成功，所以终端 App
+// 默认不写；输入框照常写，写完照样确认真的写进去了
+func writeSelectedText(_ text: String, to target: FocusedTarget, terminalInputField: Bool = false) -> AXWriteResult {
     if let bundleID = target.bundleIdentifier,
-       knownTerminalBundleIDs.contains(bundleID) || axWriteUnreliableBundleIDPrefixes.contains(where: { bundleID.hasPrefix($0) }) {
+       (!terminalInputField && knownTerminalBundleIDs.contains(bundleID)) || axWriteUnreliableBundleIDPrefixes.contains(where: { bundleID.hasPrefix($0) }) {
+        return .notApplicable
+    }
+    // 别家用 IntelliJ 平台做的 IDE（bundle ID 不是上面那些）：一样异步应用写入
+    if target.isJavaIDE {
         return .notApplicable
     }
     guard let role = target.role, axWritableRoles.contains(role), !target.isSecureTextField, !target.isWebContent else {
@@ -564,11 +570,12 @@ func writeSelectedText(_ text: String, to target: FocusedTarget) -> AXWriteResul
         // 长度、光标和选中内容都纹丝不动，说明是个假成功的空实现；稍等一下再看，给晚一步落地的控件留余地。
         // 全都读不到时没法判断：吞掉按键但不报"成功"，免得写入其实生效了、再走 ⌘V 回退又粘贴一遍。
         var sawState = false
+        var lengthAfter: Int?
         for attempt in 0..<3 {
             if attempt > 0 {
                 sleepAttentively(0.015)
             }
-            let lengthAfter = target.numberOfCharacters
+            lengthAfter = target.numberOfCharacters
             let caretAfter = target.selectedRange?.location
             if lengthAfter != nil || caretAfter != nil {
                 sawState = true
@@ -586,7 +593,13 @@ func writeSelectedText(_ text: String, to target: FocusedTarget) -> AXWriteResul
                 return sawState ? .notApplicable : .uncertain
             }
         }
-        notifyProtected("Pasted safely")
+        // 写进去了。有的 App 插入时会改写文字（Xcode 的自动缩进、智能引号……），只看长度会当成原样粘贴：读回插入处的文字核对一遍。
+        // 不一样时文字照样留着（不撤销、不重写，免得粘贴两遍），只提醒用户检查；读不回来时照旧
+        if insertedTextWasRewritten(text, in: target, selectionBefore: selectionBefore, lengthBefore: lengthBefore, lengthAfter: lengthAfter) {
+            notifyCopiNotice("\(target.applicationName) changed the pasted text as it was inserted (for example auto-indent or smart quotes). Check it.")
+        } else {
+            notifyProtected("Pasted safely")
+        }
         return .inserted
     case .cannotComplete where elapsed >= writeTimeout * 0.8:
         // 真的等到了超时：App 可能稍后才执行这次写入，不要再走 ⌘V 回退，免得粘贴两遍
@@ -595,6 +608,30 @@ func writeSelectedText(_ text: String, to target: FocusedTarget) -> AXWriteResul
         // 包括很快就返回的 cannotComplete（消息根本没送到），这时肯定没写进去
         return .notApplicable
     }
+}
+
+// writeSelectedText 写入之后，插入处的文字和写进去的不一样（App 插入时改写了）。插入了多长按字符数的实际变化算：
+// 没改写时就是预期的范围；改写时长度也可能跟着变（自动缩进），控件把 \r\n 存成 \n 时也会变短，所以换行统一成 \n 再比。
+// 读不到字符数、插入处的文字时没法判断，返回 false
+private func insertedTextWasRewritten(_ text: String, in target: FocusedTarget, selectionBefore: CFRange,
+                                      lengthBefore: Int, lengthAfter: Int?) -> Bool {
+    // 字符数和选区都来自目标 App：没有选区时 AppKit 报的 location 是 NSNotFound（Int.max）。
+    // 先确认选区落在原文里、字符数不是负数，下面的加减才不会溢出（溢出会直接崩溃）；不在范围内时没法判断
+    guard let lengthAfter, lengthAfter >= 0, !text.isEmpty, selectionBefore.location >= 0, selectionBefore.length >= 0,
+          selectionBefore.location <= lengthBefore, selectionBefore.length <= lengthBefore - selectionBefore.location else {
+        return false
+    }
+    let insertedLength = lengthAfter - (lengthBefore - selectionBefore.length)
+    guard insertedLength > 0, insertedLength <= lengthAfter - selectionBefore.location else {
+        return false
+    }
+    var range = CFRange(location: selectionBefore.location, length: insertedLength)
+    // 有的控件不支持这项查询时回一个空字符串
+    guard let readBack = AXValueCreate(.cfRange, &range).flatMap({ copyAXParameterizedAttribute(target.element, "AXStringForRange", $0) as? String }),
+          !readBack.isEmpty else {
+        return false
+    }
+    return KeystrokeTyper.normalizedNewlines(readBack) != KeystrokeTyper.normalizedNewlines(text)
 }
 
 // MARK: - 手动模式（快捷键、Action Bar）的安全复制/粘贴
@@ -627,29 +664,34 @@ func safeCopySelection() {
         }
         return
     }
-    // 读不到时顺便判断：是不是密码框、文件列表这类本来就复制不了文字的地方（这时不提示、也不清掉安全剪贴板）；选了多段时只读得到第一段
-    let (text, target, nothingToCopy, multipleSelections): (String?, FocusedTarget?, Bool, Bool) = withAXBudget(0.5) {
+    // 读不到时顺便判断：是不是密码框、文件列表这类本来就复制不了文字的地方（这时不提示、也不清掉安全剪贴板）；选了多段时只读得到第一段。
+    // Firefox 看不出选了几段（用 ⌘ 添过选区的地方）：允许剪贴板回退时也拒绝。⌘按下只在开着 Override ⌘C/⌘V 时记得下来
+    // （PointerInterceptor 的 tap 只在那时运行），手动模式下这里通常查不到
+    let (text, target, nothingToCopy, multipleSelections, unlistedSelections): (String?, FocusedTarget?, Bool, Bool, Bool) = withAXBudget(0.5) {
         let target = focusedTarget()
         if let target, target.hasMultipleSelections {
             // 原生文本视图里一段一段读出来（里面的附件占位符由 didSafeCopy 去掉）；读不全就拒绝
             if let text = target.multipleSelectionText, target.webEngine(attributeNames: target.attributeNames) == nil {
-                return (text, target, false, false)
+                return (text, target, false, false, false)
             }
-            return (nil, target, false, true)
+            return (nil, target, false, true, false)
+        }
+        if let target, target.mayHaveUnlistedSelections {
+            return (nil, target, false, true, true)
         }
         if let copied = target.flatMap({ zeroExposureCopySelection(from: $0) }) {
             // 去掉了附件时补回一个占位符，交给 didSafeCopy 识别、提示
-            return (copied.droppedAttachments ? copied.text + "\u{FFFC}" : copied.text, target, false, false)
+            return (copied.droppedAttachments ? copied.text + "\u{FFFC}" : copied.text, target, false, false, false)
         }
         let nothingToCopy = target.map { $0.isSecureTextField || $0.isKnownNonTextContext } ?? false
-        return (nil, target, nothingToCopy, false)
+        return (nil, target, nothingToCopy, false, false)
     }
     if let text {
         didSafeCopy(text, concealed: false, source: target?.bundleIdentifier)
         return
     }
     // 默认不借助系统剪贴板复制，拒绝（安全剪贴板里更早的内容一并作废）
-    if strict {
+    if strict || unlistedSelections {
         if multipleSelections {
             GlobalMode.shared.refuseCopy(app: RefusedApp(target: target), cut: false, reason: .multipleSelections)
         } else if !nothingToCopy {
@@ -733,26 +775,44 @@ enum SessionActivity {
 
 // expected：Action Bar 出现时拿着焦点的输入框。点 Paste 时焦点必须还在它上面，否则不粘贴（Action Bar 开着的时候焦点可能被别的
 // App、网页换走了，粘贴就会落进用户没想到的地方）
-func safePaste(expecting expected: AXUIElement? = nil) {
+// deliberate：是用户亲手按的快捷键、点的按钮（见 hardwareInput）。只有这样才算"再粘贴一次"的确认
+func safePaste(expecting expected: AXUIElement? = nil, deliberate: Bool) {
     let keyTime = Date()
-    PastePress.noteDeliberate(at: keyTime)
+    if deliberate {
+        PastePress.noteDeliberate(at: keyTime)
+    }
     guard let text = SecureClipboard.shared.text, !sessionIsLockedNow() else {
+        // 没有文字：Copi 里可能存着关掉 Override 之前收进来的图片、文件（Action Bar 只粘贴文字）
+        if expected == nil, !sessionIsLockedNow() {
+            GlobalMode.shared.safePasteNonText(keyTime: keyTime)
+        }
         return
     }
     let strict = ZeroExposurePolicy.isStrict
     let focused = focusedApplication()
-    if expected == nil, TransientPaste.shared.isOnPasteboard, TransientPaste.shared.isStaged(for: focused?.processIdentifier), !strict {
+    // 上一次退回剪贴板方式挂上去的这段文字还在：续期。续期也是退回剪贴板，有会把本机剪贴板同步出去的 App 在运行时一样先提醒
+    if expected == nil, TransientPaste.shared.isOnPasteboard, TransientPaste.shared.isStaged(text, for: focused?.processIdentifier), !strict {
+        // Copi 还在往这个 App 里键入上一次粘贴（或者刚打到一半停下）：续期粘贴进去的文字也会和打了一半的那段混在一起
+        if let pid = focused?.processIdentifier, KeystrokeTyper.shared.isTypingOrJustStopped(into: pid, element: nil, keyTime: keyTime) {
+            notifyPasteRefused(.stillTyping, app: RefusedApp(target: nil))
+            return
+        }
+        if let reason = remoteClipboardConfirmationBeforeFallback(text, targetPID: focused?.processIdentifier, keyTime: keyTime) {
+            TransientPaste.shared.finish()
+            notifyPasteRefused(reason, app: RefusedApp(target: nil))
+            return
+        }
         TransientPaste.shared.stage(text, restorePrevious: true, for: focused?.processIdentifier)
-        postPasteKeystroke()
+        GlobalMode.shared.postFallbackPaste()
         return
     }
     // 粘贴进放行的 App 时也不经过系统剪贴板：安全剪贴板里的文字是从别的 App 复制来的
-    let (outcome, app) = withAXBudget(0.5) { () -> (ZeroExposurePasteResult?, RefusedApp) in
+    let (outcome, app, element) = withAXBudget(0.5) { () -> (ZeroExposurePasteResult?, RefusedApp, AXUIElement?) in
         let target = focusedTarget()
         if let expected, !(target.map { CFEqual($0.element, expected) } ?? false) {
-            return (nil, RefusedApp(target: target))
+            return (nil, RefusedApp(target: target), nil)
         }
-        return (zeroExposurePaste(text, into: target, keyTime: keyTime), RefusedApp(target: target))
+        return (zeroExposurePaste(text, into: target, keyTime: keyTime), RefusedApp(target: target), target?.element)
     }
     guard let result = outcome else {
         notifyCopiNotice("The focus moved after the Action Bar appeared, so Copi pasted nothing. Click in the field you want to paste into and paste again.")
@@ -762,19 +822,24 @@ func safePaste(expecting expected: AXUIElement? = nil) {
     case .inserted, .typing:
         return
     case .unavailable(let reason):
-        if strict || !reason.allowsClipboardFallback {
-            notifyPasteRefused(reason, app: app,
-                               suffix: ZeroExposurePolicy.usesNormalClipboard(focused?.bundleIdentifier) ? normalClipboardPasteNote : "")
+        let note = ZeroExposurePolicy.usesNormalClipboard(focused?.bundleIdentifier) ? normalClipboardPasteNote : ""
+        if !reason.allowsClipboardFallback {
+            notifyPasteRefused(reason, app: app, suffix: note)
+            return
+        }
+        // 默认（不允许剪贴板回退）：第一次说明为什么，8 秒内用户亲手再粘贴一次才经过剪贴板粘贴
+        if strict, ClipboardPasteConsent.needsConfirmation(text, targetPID: focused?.processIdentifier, element: element, keyTime: keyTime) {
+            notifyPasteRefused(reason, app: app, suffix: note + ClipboardPasteConsent.offer(appName: app.name), prompts: true)
             return
         }
     }
     // 有会把本机剪贴板同步出去的 App 在运行：先提醒
-    if let reason = remoteClipboardConfirmationBeforeFallback(text, targetPID: focused?.processIdentifier) {
+    if let reason = remoteClipboardConfirmationBeforeFallback(text, targetPID: focused?.processIdentifier, keyTime: keyTime) {
         notifyPasteRefused(reason, app: app)
         return
     }
     TransientPaste.shared.stage(text, restorePrevious: true, for: focused?.processIdentifier)
-    postPasteKeystroke()
+    GlobalMode.shared.postFallbackPaste()
 }
 
 // MARK: - 键盘拦截
